@@ -1,1 +1,3 @@
+# code/ 是独立的 git 仓库（remote: https://github.com/comet-cyber/EPIC.git），
+# 不纳入本（文档）仓库，避免被当作子模块 gitlink 提交。
 code/
