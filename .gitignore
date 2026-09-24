@@ -1,3 +1,8 @@
 # code/ 是独立的 git 仓库（remote: https://github.com/comet-cyber/EPIC.git），
 # 不纳入本（文档）仓库，避免被当作子模块 gitlink 提交。
 code/
+
+# 调试固件（独立于产品的台架工程）按团队约定**不入库**：
+# 团队文档写明「不提交调试代码」。本目录只在本机存在，
+# 其结论与用法已整理进《台架调试结论与代码修改方案.md》。
+debug_corexy/
