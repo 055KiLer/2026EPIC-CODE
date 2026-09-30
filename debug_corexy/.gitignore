@@ -23,3 +23,6 @@
 # 厂商库（与产品仓库 code/ 的惯例一致：不入库，从 CubeMX/源拷贝）
 /Drivers/STM32F4xx_HAL_Driver/
 /Drivers/CMSIS/
+# 本地 CMSIS 缓存与命令行构建目录（与产品 code/ 的惯例一致，不入库）
+/MDK-ARM/.cmsis/
+/MDK-ARM/build/
