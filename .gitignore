@@ -1,8 +1,10 @@
-# code/ 是独立的 git 仓库（remote: https://github.com/comet-cyber/EPIC.git），
-# 不纳入本（文档）仓库，避免被当作子模块 gitlink 提交。
-code/
-
-# 调试固件（独立于产品的台架工程）按团队约定**不入库**：
-# 团队文档写明「不提交调试代码」。本目录只在本机存在，
-# 其结论与用法已整理进《台架调试结论与代码修改方案.md》。
-debug_corexy/
+# 本仓库 = 一体化的比赛资料仓库（文档 + 产品代码 code/ + 台架工程 debug_corexy/）
+# remote: https://github.com/055KiLer/2026EPIC-CODE.git
+#
+# 注意两点：
+# 1) code/ **同时仍是独立 git 仓库**（remote: comet-cyber/EPIC.git，存产品代码完整历史）。
+#    本仓库把它按普通文件纳入（快照），它自己的 .gitignore 照常生效
+#    （厂商库 Drivers/、Middlewares/ 与 Keil/仿真构建产物都不入库）。
+#    ⚠️ 同一份代码有两份索引：改完代码「在哪边提交」要自己定，别一半一半。
+# 2) debug_corexy/ 原是"团队约定不提交调试代码"而不入库的台架工程，
+#    2026-09-30 起按用户要求一并纳入本仓库（它的 .gitignore 同样挡构建产物与厂商库）。

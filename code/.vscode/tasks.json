@@ -1,0 +1,37 @@
+{
+  "_comment": "Run: Ctrl+Shift+B or 'Tasks: Run Task'. All call D:\\toolchain\\emb.py — edit probe/mcu in .vscode/settings.json",
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "emb: build (Keil)",
+      "type": "shell",
+      "command": "python \"D:\\toolchain\\emb.py\" build \"D:\\CUBEMX DOCUMENT\\工创\\code\"",
+      "group": {
+        "kind": "build",
+        "isDefault": true
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "emb: build (GCC)",
+      "type": "shell",
+      "command": "python \"D:\\toolchain\\emb.py\" gcc \"D:\\CUBEMX DOCUMENT\\工创\\code\\MDK-ARM\"",
+      "group": "build",
+      "problemMatcher": []
+    },
+    {
+      "label": "emb: flash (OpenOCD)",
+      "type": "shell",
+      "command": "python \"D:\\toolchain\\emb.py\" flash \"D:\\CUBEMX DOCUMENT\\工创\\code\"",
+      "group": "build",
+      "problemMatcher": []
+    },
+    {
+      "label": "emb: debug (GDB)",
+      "type": "shell",
+      "command": "python \"D:\\toolchain\\emb.py\" debug \"D:\\CUBEMX DOCUMENT\\工创\\code\"",
+      "group": "build",
+      "problemMatcher": []
+    }
+  ]
+}

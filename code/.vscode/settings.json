@@ -1,0 +1,13 @@
+{
+  "emb.mcu": "STM32F407VET",
+  "emb.probe": "dap",
+  "emb.toolchain": "keil",
+  "files.associations": {
+    ".ioc": "ini"
+  },
+  "search.exclude": {
+    "**/build_gcc": true,
+    "**/_emb_*": true,
+    "**/build": true
+  }
+}

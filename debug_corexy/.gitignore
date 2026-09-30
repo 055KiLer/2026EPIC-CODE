@@ -1,0 +1,25 @@
+# Keil 构建产物
+/MDK-ARM/debug_corexy/
+/MDK-ARM/DebugConfig/
+/MDK-ARM/*.log
+*.o
+*.d
+*.axf
+*.hex
+*.map
+*.lnp
+*.dep
+*.htm
+*.sct
+*.lst
+*.crf
+*.iex
+*.uvguix.*
+*.uvoptx
+
+# 主机侧测试产物
+/Tools/out/
+/Tools/*.exe
+# 厂商库（与产品仓库 code/ 的惯例一致：不入库，从 CubeMX/源拷贝）
+/Drivers/STM32F4xx_HAL_Driver/
+/Drivers/CMSIS/
