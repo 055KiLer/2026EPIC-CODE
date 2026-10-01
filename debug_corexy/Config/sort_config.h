@@ -163,7 +163,7 @@
 #define CFG_SERVO_TIM     htim4
 /* ⚠️ 本文件是产品 code/Config/sort_config.h 的镜像（调试舵机档位真源在 dbg_config.h
    §3，这里只保证两份拷贝不打架）；改产品值时同位改这里 */
-#define CFG_LIFT_UP_US   1600  /* 完全升起（到顶）——夹爪重装后三次标定：1150 → 1600 */
+#define CFG_LIFT_UP_US   1650  /* 完全升起（到顶）——夹爪重装后三次标定：1150 → 1600 → 1650 */
 #define CFG_LIFT_DOWN_US  1300 /* 完全放下（放到底）——夹爪重装后三次标定：900 → 1300 */
 #define CFG_CLAW_OPEN_US  1250 /* 完全展开 = 巡航安全形 = 上电位 —— 夹爪重装后三次标定：1100 → 1250 */
 #define CFG_CLAW_CLOSE_US 1950 /* 兜底夹紧（形状 0）——夹爪重装后三次标定：1750 → 1950；与产品同值 */
