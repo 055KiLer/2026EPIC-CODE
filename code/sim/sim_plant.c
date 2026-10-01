@@ -47,6 +47,39 @@ typedef char sim_plant_assert_tray[(TRAY_PIN == GPIO_PIN_0) ? 1 : -1];
 #define US_CLAW_HALF   ((uint32_t)CFG_CLAW_HALF_US)
 #define US_CLAW_OPEN   ((uint32_t)CFG_CLAW_OPEN_US)
 
+/* 夹紧位是一族值：形状 0 = 默认方案（CFG_CLAW_CLOSE_US）；形状 1~3 = 特调（CFG_GRIP_CLOSE_US）。
+   抓取判定认"进入任一夹紧值"；与产品 Sort_Grab 按形状选值的实现对应 */
+static int claw_is_close_us(uint32_t us)
+{
+    static const uint32_t close_us[CFG_NUM_SHAPES] = CFG_GRIP_CLOSE_US;
+
+    if (us == (uint32_t)CFG_CLAW_CLOSE_US) {
+        return 1; /* 形状 0 = 默认方案 */
+    }
+    for (int i = 0; i < (int)CFG_NUM_SHAPES; i++) {
+        if (us == close_us[i]) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* 形状 -> 该形状应有的夹紧脉宽（仿真"真值"，与产品同源：0 = 默认、1~3 = CFG_GRIP_* 表）。
+   try_grab 用它判"实发夹紧值 = 本物块形状对应的方案"——产品若把形状索引搞错
+   （拿另一形状的方案去夹），判不匹配 = 抓取失败、场景红，是形状路由的唯一自动化防线 */
+static uint32_t expected_close_us(uint8_t shape)
+{
+    static const uint32_t close_us[CFG_NUM_SHAPES] = CFG_GRIP_CLOSE_US;
+
+    if (shape == 0u) {
+        return (uint32_t)CFG_CLAW_CLOSE_US;
+    }
+    if (shape > (uint8_t)CFG_NUM_SHAPES) {
+        return 0u; /* 越界形状不该被产品接单：任何实发值都不会匹配 */
+    }
+    return close_us[shape - 1u];
+}
+
 /* ==================== 电机 ==================== */
 typedef struct
 {
@@ -121,7 +154,7 @@ typedef char sim_plant_assert_tjc_rows[(CFG_NUM_CATEGORIES == 6) ? 1 : -1];
 static void tjc_parse(const char *s);
 static void rx_push(int id, uint8_t b);
 static void servo_poll(void);
-static void try_grab(void);
+static void try_grab(uint32_t claw_us);
 static void release_item(uint32_t claw_us);
 
 /* ==================== 复位 ==================== */
@@ -136,7 +169,8 @@ void sim_plant_reset(void)
     }
     s_rx[2].us_per_byte = 1042;      /* UART4 备用口 @9600（原扫码口，现无设备） */
 
-    g_plant.cam_deg     = 2.0;    /* 凸块压在开关上的角度宽度（与 CFG_TRAY_BACKOFF_PULSES 直接对撞） */
+    g_plant.cam_deg     = 3.0;    /* 凸块压在开关上的角度宽度：2026-10-01 台架实测 >1.8°
+                                      （600 脉冲退距退不出来）→ 3.0° 正好逼出"自动加退"路径 */
     g_plant.driver_ppr  = 3200;
     g_plant.belt_mm     = 40.0;
     /* 转盘减速比 = 皮带(30/16) × 减速箱(1:20) = 37.5 ⇒ 转盘一圈 3200×37.5 = 120000 电机脉冲。
@@ -148,15 +182,16 @@ void sim_plant_reset(void)
     g_plant.phys_sign_b = 1;
     g_plant.tray_phys_sign = 1;
     g_plant.tray_start_deg = 120.0;
-    g_plant.home_x_mm   = 300.0;
-    g_plant.home_y_mm   = 200.0;
-    g_plant.drop_x      = 200.0f;
-    g_plant.drop_y      = 340.0f;
+    /* 2026-10-01 起世界坐标系 = 台架/产品同框（第三象限，原点 = 归零驻留位） */
+    g_plant.home_x_mm   = 0.0f;
+    g_plant.home_y_mm   = 0.0f;
+    g_plant.drop_x      = -70.0f;
+    g_plant.drop_y      = -187.0f;
     g_plant.vision_err_mm = 0.0;
-    /* 视觉标定真值：视觉原点（标定中心）在机械坐标系里 = (60,45)，两个方向符号都为正
-       —— 与 shim/sort_config.h 的 SIM_VISION_* 必须逐字一致（sim_main 启动时比较） */
-    g_plant.vision_origin_x_mm = 60.0;
-    g_plant.vision_origin_y_mm = 45.0;
+    /* 视觉标定真值：视觉原点（标定中心）在机械坐标系里 = (-80,-45)（2026-10-01 台架实测），
+       两个方向符号都为正 —— 与 shim/sort_config.h 的 SIM_VISION_* 必须逐字一致（sim_main 启动时比较） */
+    g_plant.vision_origin_x_mm = -80.0;
+    g_plant.vision_origin_y_mm = -45.0;
     g_plant.vision_sign_vy_to_x = 1;
     g_plant.vision_sign_vx_to_y = 1;
     g_plant.verbose     = 0;
@@ -592,7 +627,7 @@ static void motor_step(motor_t *m, int mid, double dt_s)
 }
 
 /* ==================== 抓取 / 放件 ==================== */
-static void try_grab(void)
+static void try_grab(uint32_t claw_us)
 {
     int best = -1;
     double bd = 1e18;
@@ -613,11 +648,24 @@ static void try_grab(void)
         }
     }
     if (best >= 0 && bd <= s_item[best].spec.grab_radius_mm * 2.0) {
+        uint32_t want = expected_close_us(s_item[best].spec.shape);
+
+        if (claw_us != want) {
+            /* 夹持方案与物块形状不匹配：角度不对 = 夹不住（滑脱，货留在托盘上）——
+               产品端把形状传错/方案索引搞错在这条路径上立刻现形（场景判 FAIL） */
+            g_res.items_empty_grab++;
+            if (g_plant.verbose) {
+                printf("  [%6.2fs][抓] #%d 夹持方案与形状不匹配（形状 %u：期望 %u us，实发 %u us）-> 滑脱\n",
+                       (double)sim_now_us_get() / 1e6, best, s_item[best].spec.shape,
+                       (unsigned)want, (unsigned)claw_us);
+            }
+            return;
+        }
         s_item[best].state = IT_HELD;
         s_held = best;
         if (g_plant.verbose) {
-            printf("  [%6.2fs][抓] #%d 成功 位置偏差 %.1fmm\n",
-                   (double)sim_now_us_get() / 1e6, best, bd);
+            printf("  [%6.2fs][抓] #%d 成功 位置偏差 %.1fmm（形状 %u）\n",
+                   (double)sim_now_us_get() / 1e6, best, bd, s_item[best].spec.shape);
         }
     } else {
         g_res.items_empty_grab++;
@@ -639,8 +687,8 @@ static void release_item(uint32_t claw_us)
     s_item[i].x = s_x_mm;
     s_item[i].y = s_y_mm;
 
-    if (claw_us == US_CLAW_CLOSE) {
-        return;   /* 不会发生：只处理离开闭合位的两档 */
+    if (claw_is_close_us(claw_us)) {
+        return;   /* 不会发生：只处理离开夹紧位的那一次切换 */
     }
     {
         int to_drop = (claw_us == US_CLAW_OPEN) ? 1 : 0;   /* 全开=投放，半开=轻放 */
@@ -705,16 +753,16 @@ static void servo_poll(void)
         if (prev == 0xFFFFFFFFu) {
             return;               /* 上电安全位，不做判定 */
         }
-        if (cl == US_CLAW_CLOSE && prev != US_CLAW_CLOSE) {
+        if (claw_is_close_us(cl) && !claw_is_close_us(prev)) {
             if (s_last_lift == US_LIFT_DOWN) {
-                try_grab();
+                try_grab(cl);
             } else if (s_held >= 0) {
                 g_res.items_empty_grab++;
                 printf("  [%6.2fs][抓] 升降未下伸就闭合且手上有货 -> 货被夹飞风险\n",
                        (double)sim_now_us_get() / 1e6);
             }
             /* 抬升位闭合 = 投放后复位空爪，物理上夹不到东西，不作判定 */
-        } else if (prev == US_CLAW_CLOSE && cl != US_CLAW_CLOSE) {
+        } else if (claw_is_close_us(prev) && !claw_is_close_us(cl)) {
             release_item(cl);
         }
     }
@@ -800,7 +848,7 @@ void sim_plant_step_us(uint32_t dt_us)
             x10 = (int16_t)lround(vx * 10.0); /* 帧里的 X = 视觉 x（视觉系 x+ = 机械 Y+） */
             y10 = (int16_t)lround(vy * 10.0);
             f[3] = s_item[t].spec.category; /* 类别 ID 1~6（原"颜色"字节） */
-            f[4] = 0x00u;                   /* 原"形状"字节：2026-09-30 起协议固定发 0 */
+            f[4] = s_item[t].spec.shape;    /* 形状 1~3（原"形状"字节；2026-10-01 起启用） */
             f[5] = s_item[t].spec.has_qr;
             f[6] = 0x00u;
         } else {

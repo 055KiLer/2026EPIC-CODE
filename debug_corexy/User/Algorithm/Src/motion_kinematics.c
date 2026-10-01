@@ -62,6 +62,9 @@ uint8_t Kinematics_TrayBinOf(uint32_t pulses) {
     return (uint8_t)(bin % CFG_TRAY_BINS);
 }
 
+/* ★ 本副本的包络函数是历史版本（旧 CFG_WORK_MIN_MM/MAX_X/MAX_Y 口径）：台架工程内无人调用——
+   台架软限位判定走 dbg_config.h 的 DBG_CFG_XY_X_MIN_MM/X_CLAMP_MM/Y_* 直接比较；
+   产品现行口径 = 第三象限四宏 CFG_WORK_X_MIN/X_MAX/Y_MIN/Y_MAX，改产品时不必同步这里 */
 uint8_t Kinematics_XyInEnvelope(float x_mm, float y_mm) {
     /* 必须"两个都成立才放行"：写成"任一不成立则拒绝"时 NaN 会让两侧比较同时为假 */
     if (x_mm >= CFG_WORK_MIN_MM && x_mm <= CFG_WORK_MAX_X_MM && y_mm >= CFG_WORK_MIN_MM &&

@@ -1,14 +1,9 @@
 /**
  * @file    dbg_uart.h
- * @brief   三路串口：控制台 + 电机 A 线 + 电机 B 线，各自带接收环形缓冲
+ * @brief   六路串口：控制台 + 电机 A/B/转盘三条线 + 屏线(USART6) + 视觉线(USART2)，各自带接收环形缓冲
  * @note    2026-09-30 起接线与产品工程一致：三台驱动器**各占一路 UART**
  *          （转盘=USART1/M3，A=USART3/M1，B=UART5/M2），不再是一条总线挂多台。
- *          电机线的接收缓冲用途：
- *            1) `loop` 自检：把该线的 TX/RX 短接起来，能收到自己发出去的帧
- *               = MCU 这条线的发送链路（时钟/引脚/波特率）没问题
- *            2) **收回包**：驱动器收到正确命令会回 [地址][功能码][02][6B]，
- *               这是"帧到底进没进驱动器"最硬的证据（解读见 dbg_app.c 的 AckReport）
- *          一条线只有一台驱动器，回包不再互相撞车——广播帧的应答也能逐线读到了。
+ *          2026-10-01 接入产品另两条链路（屏=CN2/USART6，视觉=CN3/USART2），与产品同口同脚。
  *          电机线编号约定：0 = A（USART3），1 = B（UART5），2 = 转盘（USART1），
  *          与 zdt_bus.h 的 Dbg_Motor_e 数值一致（BSP 层不反向包含 Devices 头，用数字传参）
  */
@@ -19,7 +14,7 @@
 
 #define DBG_UART_RX_BUF_SIZE 128u /* 2 的幂 */
 
-/* 三路串口都挂接收中断 */
+/* 六路串口都挂接收中断 */
 void Dbg_Uart_Init(void);
 
 /* ---- 控制台 ---- */
@@ -45,11 +40,24 @@ void     Dbg_Uart_MotorArm(uint8_t motor);
  */
 void     Dbg_Uart_MotorDisarm(uint8_t motor);
 
-/* 中断入口：由 Core/Src/stm32f4xx_it.c 里的 USART1/USART3/UART5/UART4_IRQHandler 调用。
+/* ---- 屏线（USART6/CN2）：只发为主，Flush/Read 供回环自检与杂音观察 ---- */
+uint16_t Dbg_Uart_ScreenAvailable(void);
+uint8_t  Dbg_Uart_ScreenReadByte(void);
+void     Dbg_Uart_ScreenFlush(void);
+uint8_t  Dbg_Uart_SendScreen(const uint8_t *data, uint16_t len);
+
+/* ---- 视觉线（USART2/CN3）：只收（产品同口径，本侧不发）---- */
+uint16_t Dbg_Uart_VisionAvailable(void);
+uint8_t  Dbg_Uart_VisionReadByte(void);
+void     Dbg_Uart_VisionFlush(void);
+
+/* 中断入口：由 Core/Src/stm32f4xx_it.c 里的 USARTx_IRQHandler 调用。
    之所以自写而不用 HAL_UART_IRQHandler：HAL 在 RxState 不是 BUSY_RX 时
    既不清标志也不回调，只要 RXNEIE 还开着就会无限重进中断、把 CPU 吃干 */
 void     Dbg_Uart_IsrPushMotor(uint8_t motor, uint8_t byte, uint32_t sr);
 void     Dbg_Uart_IsrPushConsole(uint8_t byte, uint32_t sr);
+void     Dbg_Uart_IsrPushScreen(uint8_t byte, uint32_t sr);
+void     Dbg_Uart_IsrPushVision(uint8_t byte, uint32_t sr);
 
 /* ★ 控制台 RX 线路体检：PA1 当输入采样，量"起点电平 + 边沿数"（见 dbg_uart.c）*/
 void     Dbg_Uart_ProbeConsoleRx(void);
@@ -75,11 +83,12 @@ uint32_t Dbg_Uart_MotorBaud(uint8_t motor);
 /* ★ 接收自愈：主循环每圈调一次；哪一路没挂在收就重新挂上。
    串口因噪声/溢出出错后可能一直停摆（现象是"板子还在打、命令却一个都不进"），
    这一句就是那种"必须复位才能恢复"怪象的根治手段。
-   同时自愈 CR1 的 UE/RE/TE（实测两路 UE 曾同时被清零、收发全停） */
+   同时自愈 CR1 的 UE/RE/TE（实测两路 UE 曾同时被清零、收发全停）。
+   屏/视觉线被噪声预算关掉后由这里到期自动重开（电机线按需重开） */
 void Dbg_Uart_EnsureRxArmed(void);
 
-/* UE 自愈计数（which: 0=控制台 1=A线 2=B线 3=转盘线）：正常应为 0；>0 = 该路 CR1 曾被
-   外部因素破坏并被自愈救回——次数增长说明问题在复发，需要继续抓根因 */
+/* UE 自愈计数（which: 0=控制台 1=A线 2=B线 3=转盘线 4=屏线 5=视觉线）：正常应为 0；
+   >0 = 该路 CR1 曾被外部因素破坏并被自愈救回——次数增长说明问题在复发，需要继续抓根因 */
 uint16_t Dbg_Uart_UeHealCount(uint8_t which);
 
 #endif

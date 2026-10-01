@@ -25,7 +25,8 @@ typedef struct
 {
     float item_x_mm;      /* 当前应抓目标的机械坐标（K230 已标定后的值） */
     float item_y_mm;
-    uint8_t category;     /* 货物类别 ID 1~6（帧的原颜色字节；形状字节固定 0） */
+    uint8_t category;     /* 货物类别 ID 1~6（帧的原颜色字节）：决定进哪个盒 */
+    uint8_t shape;        /* 货物形状 1~3（帧的原形状字节）：不参与分类，只选夹持方案 */
     uint8_t has_qr;       /* K230 帧 byte[5]：产品侧保持解析但不使用（模拟污渍） */
     float grab_radius_mm; /* 夹爪可夹住的半径 */
 } sim_item_t;

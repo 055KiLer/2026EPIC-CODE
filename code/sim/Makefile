@@ -13,7 +13,9 @@ INC      := -I. -Ishim -I../Config \
             -I../User/Algorithm/Inc -I../User/App/Inc \
             -I../User/Bsp/Inc -I../User/Devices/Inc
 WARN     := -Wall -Wextra -Wno-unused-parameter -Wno-address-of-packed-member
-CFLAGS   := -std=gnu99 -O0 -g $(WARN) $(INC)
+# -DSIM：产品代码里的仿真分支开关（当前唯一分叉点 = bsp_uart 的发送路径走
+# HAL_UART_Transmit —— 仿真台的屏丢帧注入/按波特率计时挂在它上面，见 bsp_uart.c）
+CFLAGS   := -std=gnu99 -O0 -g $(WARN) $(INC) -DSIM
 LDLIBS   := -lm
 
 SRC      := $(wildcard ../User/Algorithm/Src/*.c) \
@@ -33,9 +35,7 @@ OBJ_FILL := $(addprefix out/fill/,$(NAMES:.c=.o))
 OBJ_ZERO := $(addprefix out/zero/,$(NAMES:.c=.o))
 
 SCENES   := s1 s2 s3 s6 s7 s8 s9 s10 s11 s12 s13 s14 s15 s16 s17 s19
-ALL_SCENE:= $(SCENES) s18
 
-.PHONY: all run clean list $(SCENES) s18
 
 all: out/sim out/sim_zero
 
@@ -63,8 +63,6 @@ $(1): all
 endef
 $(foreach sc,$(SCENES),$(eval $(call SCENE_RULE,$(sc))))
 
-s18: all
-	@out/sim_zero s18 $(A)
 
 list: all
 	@out/sim 2>/dev/null || true
@@ -80,13 +78,5 @@ run: all
 	    fail=$$((fail+1)); \
 	  fi; \
 	done; \
-	if out/sim_zero s18 > out/log_s18.txt 2>&1; then \
-	  echo "  PASS  s18  $$(grep -m1 '^场景' out/log_s18.txt)"; pass=$$((pass+1)); \
-	else \
-	  echo "  FAIL  s18  $$(grep -m1 '^场景' out/log_s18.txt)"; fail=$$((fail+1)); \
-	fi; \
 	echo "------------------------------------------"; \
 	echo "  PASS $$pass / FAIL $$fail  （日志 out/log_*.txt）"
-
-clean:
-	rm -rf out

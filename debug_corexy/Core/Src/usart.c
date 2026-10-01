@@ -1,9 +1,9 @@
 /**
   ******************************************************************************
   * @file    usart.c
-  * @brief   四路串口初始化：USART1 转盘线 + USART3 电机A线 + UART5 电机B线 + UART4 控制台
-  * @note    2026-09-30 起接线与产品工程一致（PCB 已修复）：两台 CoreXY 驱动器
-  *          各占一路 UART（M1/M2），不再共用一条总线
+  * @brief   六路串口初始化：USART1 转盘线 + USART3 电机A线 + UART5 电机B线 + UART4 控制台
+  *          + USART6 屏线 + USART2 视觉线
+  * @note    2026-09-30 起接线与产品工程一致（PCB 已修复）；2026-10-01 接入屏/视觉两条链路
   ******************************************************************************
   */
 /* Includes ------------------------------------------------------------------*/
@@ -14,6 +14,8 @@ UART_HandleTypeDef huart1;
 UART_HandleTypeDef huart3;
 UART_HandleTypeDef huart5;
 UART_HandleTypeDef huart4;
+UART_HandleTypeDef huart6;
+UART_HandleTypeDef huart2;
 
 /* USART1：转盘 57 线，PB6(TX)/PB7(RX)，115200（产品板 M3 座，与产品 CFG_UART_TRAY 同口） */
 void MX_USART1_UART_Init(void)
@@ -78,6 +80,40 @@ void MX_UART4_Init(void)
   huart4.Init.HwFlowCtl = UART_HWCONTROL_NONE;
   huart4.Init.OverSampling = UART_OVERSAMPLING_16;
   if (HAL_UART_Init(&huart4) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
+/* USART6：串口屏，PC6(TX)/PC7(RX)，115200（产品板 CN2 座，与产品 CFG_UART_SCREEN 同口） */
+void MX_USART6_UART_Init(void)
+{
+  huart6.Instance = USART6;
+  huart6.Init.BaudRate = DBG_CFG_SCREEN_BAUD;
+  huart6.Init.WordLength = UART_WORDLENGTH_8B;
+  huart6.Init.StopBits = UART_STOPBITS_1;
+  huart6.Init.Parity = UART_PARITY_NONE;
+  huart6.Init.Mode = UART_MODE_TX_RX;
+  huart6.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart6.Init.OverSampling = UART_OVERSAMPLING_16;
+  if (HAL_UART_Init(&huart6) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
+/* USART2：视觉 ROCK 5C，PD5(TX)/PD6(RX)，115200（产品板 CN3 座；产品口径本侧只收不发） */
+void MX_USART2_UART_Init(void)
+{
+  huart2.Instance = USART2;
+  huart2.Init.BaudRate = DBG_CFG_VISION_BAUD;
+  huart2.Init.WordLength = UART_WORDLENGTH_8B;
+  huart2.Init.StopBits = UART_STOPBITS_1;
+  huart2.Init.Parity = UART_PARITY_NONE;
+  huart2.Init.Mode = UART_MODE_TX_RX;
+  huart2.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart2.Init.OverSampling = UART_OVERSAMPLING_16;
+  if (HAL_UART_Init(&huart2) != HAL_OK)
   {
     Error_Handler();
   }

@@ -13,19 +13,6 @@
 /* 清零记账坐标与盒号，并标记为不可信（回零前必须调用） */
 void Motion_Init(void);
 
-/**
- * @brief  上电驱动器自检：逐台发使能帧并读应答（CFG_SELFTEST_ON_BOOT 控制是否在 Init 里自动跑）
- * @note   两种静默失效只有它能发现：① 完全不应答（数据线/地址/波特率）
- *         ② 只应答不执行运动（控制模式=脉冲+方向）。失败不阻断运行，但结果要上屏/记日志
- */
-void Motion_SelfCheck(void);
-
-/* 自检结果：1=三台都在（或未启用自检）  0=有一台没通过 */
-uint8_t Motion_SelfCheckOk(void);
-
-/* 自检失败的位图：bit0=A bit1=B bit2=转盘（1=没通过） */
-uint8_t Motion_SelfCheckFailMask(void);
-
 /* 守护任务入口：1ms 周期取走 EXTI 事件并急停（须在回零前创建） */
 void Motion_SafetyTask(void *argument);
 

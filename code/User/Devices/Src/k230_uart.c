@@ -63,7 +63,7 @@ K230_Event_e K230_FeedByte(uint8_t byte, K230_Target_t *frame_out) {
 
                             frame_out->valid    = 1u;
                             frame_out->category = s_buf[3]; /* 类别 ID 1~6（原颜色字节） */
-                            frame_out->shape    = s_buf[4]; /* 保留：协议固定 0 */
+                            frame_out->shape    = s_buf[4]; /* 形状 0~3：0=默认方案、1~3=特调（不参与分类） */
                             frame_out->has_qr   = s_buf[5];
                             frame_out->x_mm     = (float)x10 * 0.1f;
                             frame_out->y_mm     = (float)y10 * 0.1f;

@@ -70,6 +70,16 @@ uint8_t Dbg_App_Square(int32_t mm, uint16_t speed_mm_s);
 uint8_t Dbg_App_HomeX(uint16_t speed_mm_s);
 uint8_t Dbg_App_HomeY(uint16_t speed_mm_s);
 
+/* ★ 一键全回零（`home`）：homex → homey → thome 顺序串跑 = 产品上电 Sort_EnsureCalibrated
+   自动做的那一步（产品 Motion_HomeXY 同样是 X 先 Y 后的串行）。任一步失败即停（后面不跑），
+   每步都可用单轴命令单独重试 */
+uint8_t Dbg_App_HomeAll(void);
+
+/* ★ 上电自动归零（DBG_CFG_AUTO_HOME_ON_BOOT）：横幅/帮助打完后等
+   DBG_CFG_AUTO_HOME_SKIP_MS，期间控制台任意字节 = 本次跳过（字节留在缓冲照常执行）；
+   窗口内安静 = 自动跑 Dbg_App_HomeAll()。main.c 在打完帮助后调它 */
+void Dbg_App_AutoHomeIfEnabled(void);
+
 /* 打印当前记账位置（`p` 不带参数时） */
 void Dbg_App_PrintPosition(void);
 
@@ -118,8 +128,15 @@ uint8_t Dbg_App_TrayHome(uint16_t seek_rpm);
  */
 uint8_t Dbg_App_TrayGotoBin(uint8_t bin);
 
-/* 打印转盘记账与标定常量（`tb` 不带参数时） */
+/* 打印转盘记账与标定常量（`tb` 不带参数时）；盒号显示 1~6（盒1=回零位那格） */
 void Dbg_App_TrayPrint(void);
+
+/**
+ * @brief  ★tb <类别1~6> 一句到位：类别号查映射表（dbg_config.h §4d，缺省恒等）转到该
+ *         类别的物理盒——与产品 Sort_DoCycle 的 s_category_to_bin 同一张表的台架副本
+ * @param  category 视觉类别 ID 1~6（= `read` 打出的类别号）
+ */
+uint8_t Dbg_App_TrayGotoCategory(uint8_t category);
 
 /**
  * @brief  ★盲测工具①：把"使能帧 + 位置帧"的**字节**打出来（不发）
@@ -204,8 +221,18 @@ extern volatile uint32_t g_move_act_ms; /* 上次运动实测时长 */
  * @brief  ★抓取全流程（pick）：张开 → [可选先定位到 (x,y)] → 初步夹住 → 下放 → 夹紧 → 抬回
  * @note   时序由机构构造决定（dbg_config.h §3 注释）：巡航不全开会撞托盘边/物块，
  *         没放到底就夹紧会顶死。带坐标时先 `p` 同一套记账定位（需已归零），
- *         定位失败则爪时序不执行
+ *         定位失败则爪时序不执行。
+ *         shape 0~3（缺省 0）= 夹持方案：0 = 默认（兜底值）、1 = 立方体、2 = 12面体、
+ *         3 = 六棱柱（取 DBG_CFG_GRIP_* 表对应值），与产品 Sort_Grab(shape) 同口径；
+ *         越界传 0 兜底
  */
-uint8_t Dbg_App_Pick(float x, float y, uint16_t speed_mm_s, uint8_t has_xy);
+uint8_t Dbg_App_Pick(float x, float y, uint16_t speed_mm_s, uint8_t has_xy, uint8_t shape);
 
-#endif
+/* ★ 读帧位取目标（`read [等待s]`，台架版产品读帧纪律）：归零后走到投放点上方（不挡相机）
+ *   → 静默 CFG_VISION_SETTLE_MS → 清缓存 → 等一帧新鲜目标，打印类别/视觉坐标/机械坐标
+ *   和可直接照抄的 `pick X Y`。作为抓取依据的坐标必须出自它（归零位读帧=挡相机，不可信）
+ * @param wait_s 等待上限 1~120s，0 = 默认 10s；任意键中止
+ */
+uint8_t Dbg_App_ReadTarget(uint16_t wait_s);
+
+#endif /* __DBG_APP_H__ */

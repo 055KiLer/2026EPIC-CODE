@@ -22,9 +22,18 @@ static uint8_t Zdt_Send(Zdt_ID_e id, const uint8_t *frame, uint16_t len) {
 }
 
 /* 名义转速 -> 帧内速度字段（乘单位系数，见 sort_config.h 的 CFG_ZDT_SPEED_FIELD_SCALE）。
-   集中在这一处换算：算法层继续用真实 RPM，设备层负责适应驱动器口径 */
+   集中在这一处换算：算法层继续用真实 RPM，设备层负责适应驱动器口径。
+   上限 600：XY 侧另有解算器 300 上限，这里管的是转盘（二次提速后最高寻标 480，
+   旧 300 钳位会把寻标静默砍到 300——台架 Dbg_App_TrayRpm 同口径放宽） */
+#define ZDT_SPEED_FIELD_MAX 600u
+
 static uint16_t Zdt_SpeedField(uint16_t speed_rpm) {
-    uint32_t field = (uint32_t)speed_rpm * (uint32_t)CFG_ZDT_SPEED_FIELD_SCALE;
+    uint32_t field;
+
+    if (speed_rpm > ZDT_SPEED_FIELD_MAX) {
+        speed_rpm = (uint16_t)ZDT_SPEED_FIELD_MAX;
+    }
+    field = (uint32_t)speed_rpm * (uint32_t)CFG_ZDT_SPEED_FIELD_SCALE;
 
     if (field > 65535u) {
         field = 65535u;
@@ -85,41 +94,9 @@ uint8_t Zdt_SpeedMode(Zdt_ID_e id, Zdt_DIR_e dir, uint16_t speed_rpm, uint8_t ac
     return Zdt_Send(id, frame, sizeof(frame));
 }
 
-/* 驱动器自检：发使能帧后读回包。
-   回包格式（台架实测）：[地址][功能码][02][6B] = 命令已正确接收；
-                        [地址][00][EE][6B] = 校验/帧被拒；[地址][00][E2][6B] = 参数越界。
-   本函数只判"这一路驱动器在不在、收不收" —— 使能帧不含运动指令，电机不会走 */
-Zdt_Probe_e Zdt_Probe(Zdt_ID_e id, uint32_t timeout_ms) {
-    uint8_t  buf[8];
-    uint16_t n;
-
-    if (id >= ZDT_ID_NUM) {
-        return ZDT_PROBE_NO_REPLY;
-    }
-
-    Bsp_Uart_Flush(s_uart[id]); /* 只认这一帧的回包 */
-    if (Zdt_Enable(id, 1u) == 0u) {
-        return ZDT_PROBE_NO_REPLY;
-    }
-
-    n = Bsp_Uart_ReadReply(s_uart[id], buf, sizeof(buf), timeout_ms);
-    if (n == 0u) {
-        return ZDT_PROBE_NO_REPLY;
-    }
-
-    for (uint16_t i = 0u; (uint16_t)(i + 2u) < n; i++) {
-        if (buf[i + 2u] != ZDT_CHECKSUM) {
-            continue;
-        }
-        if (buf[i + 1u] == 0x02u) {
-            return ZDT_PROBE_OK;
-        }
-        if ((buf[i + 1u] == 0xEEu) || (buf[i + 1u] == 0xE2u)) {
-            return ZDT_PROBE_REJECT; /* 驱动器听见了但不接受（模式/校验/参数） */
-        }
-    }
-    return ZDT_PROBE_REJECT; /* 收到字节但不是标准应答：按"有回应但不正常"处理 */
-}
+/* "驱动器自检"（发使能帧读回包的 Zdt_Probe）已删除：本批驱动器对广播不回包
+   （台架 2026-09-30 定稿），等回包只会永远误报失败；本层与电控文档 §4.3 一致，
+   主控只发不收 */
 
 uint8_t Zdt_Stop(Zdt_ID_e id) {
     uint8_t frame[5] = {ZDT_ADDR_BROADCAST, 0xFEu, 0x98u, 0x00u, ZDT_CHECKSUM};

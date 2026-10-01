@@ -485,9 +485,39 @@
               <FilePath>../User/Devices/Src/servo_out.c</FilePath>
             </File>
             <File>
+              <FileName>k230_uart.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>../User/Devices/Src/k230_uart.c</FilePath>
+            </File>
+            <File>
+              <FileName>dbg_vision.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>../User/Devices/Src/dbg_vision.c</FilePath>
+            </File>
+            <File>
+              <FileName>tjc_screen.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>../User/Devices/Src/tjc_screen.c</FilePath>
+            </File>
+            <File>
               <FileName>servo_out.h</FileName>
               <FileType>5</FileType>
               <FilePath>..\User\Devices\Inc\servo_out.h</FilePath>
+            </File>
+            <File>
+              <FileName>k230_uart.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>..\User\Devices\Inc\k230_uart.h</FilePath>
+            </File>
+            <File>
+              <FileName>dbg_vision.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>..\User\Devices\Inc\dbg_vision.h</FilePath>
+            </File>
+            <File>
+              <FileName>tjc_screen.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>..\User\Devices\Inc\tjc_screen.h</FilePath>
             </File>
             <File>
               <FileName>zdt_bus.h</FileName>

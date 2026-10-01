@@ -11,10 +11,16 @@
 static const uint16_t s_lift_us[2] = {CFG_LIFT_UP_US, CFG_LIFT_DOWN_US};
 static const uint16_t s_claw_us[3] = {CFG_CLAW_OPEN_US, CFG_CLAW_CLOSE_US, CFG_CLAW_HALF_US};
 
-/* 1 tick = 1us */
+/* 1 tick = 1us。写入前钳到安全窗：配置写坏值（如多打一个 0）时不至于把舵机顶死 */
 static void Servo_Write(Servo_ID_e id, uint16_t pulse_us) {
     uint32_t channel = (id == SERVO_LIFT) ? SERVO_LIFT_CHANNEL : SERVO_CLAW_CHANNEL;
 
+    if (pulse_us < CFG_SERVO_MIN_US) {
+        pulse_us = (uint16_t)CFG_SERVO_MIN_US;
+    }
+    if (pulse_us > CFG_SERVO_MAX_US) {
+        pulse_us = (uint16_t)CFG_SERVO_MAX_US;
+    }
     __HAL_TIM_SET_COMPARE(&CFG_SERVO_TIM, channel, pulse_us);
 }
 
@@ -36,4 +42,8 @@ void Servo_ClawSet(Servo_ClawPOS_e pos) {
     if ((unsigned)pos < (unsigned)(sizeof(s_claw_us) / sizeof(s_claw_us[0]))) {
         Servo_Write(SERVO_CLAW, s_claw_us[pos]);
     }
+}
+
+void Servo_ClawSetUs(uint16_t pulse_us) {
+    Servo_Write(SERVO_CLAW, pulse_us);
 }

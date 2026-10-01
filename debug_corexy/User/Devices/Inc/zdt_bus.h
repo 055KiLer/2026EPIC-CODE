@@ -22,7 +22,7 @@ typedef enum {
     DBG_MOTOR_COUNT
 } Dbg_Motor_e;
 
-/* 地址表在 Config/dbg_config.h（DBG_CFG_MOTOR_A_ID / _B_ID），上电自检会自动采纳 */
+/* 地址：全广播寻址定调后 A/B/T 默认都是 0x00（运动一律广播）；`id` 命令可运行时改登记地址 */
 uint8_t     Zdt_Bus_AddrOf(Dbg_Motor_e motor);
 const char *Zdt_Bus_NameOf(Dbg_Motor_e motor);
 

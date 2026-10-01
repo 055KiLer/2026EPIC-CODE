@@ -35,13 +35,22 @@
 /* ★ 视觉坐标 -> 机械坐标（2026-09-30 视觉组口径）：**两轴交换 + 平移**，不是纯平移。
    视觉标定中心 = 视觉原点，在托盘上"距**左边** 87.5mm、距**底部** 82.5mm"处；
    视觉系 x+ = 机械 Y+、视觉系 y+ = 机械 X+ ⇒ 机械 X 由帧里的 y 得来、机械 Y 由帧里的 x 得来。
-   CFG_VISION_ORIGIN_X/Y_MM = 视觉原点在机械坐标系里的**绝对坐标**（联调卷尺实测回填；
-   0 = 未标定，此时整机按未标定对待，绝对定位会被工作包络拒绝）。
-   符号：某一轴实测"走到镜像位置"才翻对应 SIGN（±1），别动别处 */
-#define CFG_VISION_ORIGIN_X_MM  0.0f
-#define CFG_VISION_ORIGIN_Y_MM  0.0f
+   CFG_VISION_ORIGIN_X/Y_MM = 视觉原点在机械坐标系里的**绝对坐标**。
+   ★ 本工程坐标系 = 第三象限（原点 = 归零驻留位，X≤0/Y≤0）：
+     2026-10-01 首次标定回填：视觉原点 ≈ 夹爪走到 (-80, -45) 处（用户实测，"大概"级精度，
+     `k230` 换算从此为真值）；SIGN 符号仍默认 +1/+1，待托盘四角放货核镜像后定稿。
+     精修法：四角各放一件看落点——恒定偏差→平移修 ORIGIN；镜像→翻对应 SIGN（±1）
+   ★ 2026-10-01 抓取偏移修正（实抓迭代定值，与产品同步，爪要往 + 走则原点 +）：
+     Y：-45 → -60 → **-57.5**（再向 +Y 补 2.5）；X：-80 → -75 → **-70**（再向 +X 补 5） */
+#define CFG_VISION_ORIGIN_X_MM  (-70.0f)
+#define CFG_VISION_ORIGIN_Y_MM  (-57.5f)
 #define CFG_VISION_SIGN_VY_TO_X (+1.0f) /* 机械 X = ORIGIN_X + SIGN × 帧.y_mm */
 #define CFG_VISION_SIGN_VX_TO_Y (+1.0f) /* 机械 Y = ORIGIN_Y + SIGN × 帧.x_mm */
+
+/* ★ 读帧时机（2026-09-30 现场口径）：归零/待机时龙门正压托盘上方、挡相机，取的帧不可信
+   ——读帧位 = 投放点上方，到位后先静默这段再清缓存取帧（台架对应 `read` 命令）。
+   症状判据：出现"抓着刚取走物块的旧坐标"（抓空、计数虚增）就把它调大 */
+#define CFG_VISION_SETTLE_MS 500u
 
 /* 串口屏 */
 #define CFG_DISPLAY_DONE_TIMEOUT_MS 2000u
@@ -126,7 +135,11 @@
 #define CFG_TRAY_APPROACH_RPM        30
 #define CFG_TRAY_BACKOFF_PULSES      600u  /* = 转盘 1.8°；必须 > 凸块作用宽度，
                                               不够时固件会自动再退一份（2×）兜底 */
-#define CFG_TRAY_APPROACH_TIMEOUT_MS 1500u
+#define CFG_TRAY_APPROACH_TIMEOUT_MS 4000u /* ★ 1500→4000（2026-10-01）：台架等待按
+                                              tspd 百分比缩放（400% 时 4000→1500ms，@120rpm
+                                              = 28.8° 行程预算 = 产品同口径）；相位3 在
+                                              "过冲回找没找到窗口"后要多走 14.4° 才碰沿，
+                                              旧 1500（缩放后 875ms=16.8°）不够 */
 #define CFG_TRAY_HOME_TIMEOUT_MS                                                 \
     25000u                        /* 必须 > 一圈：120000 脉冲 @120rpm = 18.75s（总比 37.5） */
 #define CFG_TRAY_DIR_FORWARD 0x00 /* 标反 = 全部静默镜像放错盒 */
@@ -135,8 +148,12 @@
 #define CFG_SAFETY_PERIOD_MS 1u
 
 /* 货物类别 ID（2026-09-30 视觉组口径，与产品同步）：上位机不拆颜色×形状，直接给类别 1~6
-   （放帧的原"颜色"字节，形状字节固定 0）。调试固件不跑视觉，这里只是与产品保持一份真源 */
+   （放帧的原"颜色"字节）。调试固件不跑视觉，这里只是与产品保持一份真源 */
 #define CFG_NUM_CATEGORIES 6
+/* ★ 特调形状个数（2026-10-01 视觉组口径，与产品同步）：形状 **0 = 默认方案**（不在三种
+   特调之内），**1 = 立方体、2 = 12面体、3 = 六棱柱**。台架校验/命令的形状参上限取自这里
+   （dbg_vision.c 收帧校验、dbg_app.c 的 pick、dbg_console.c）——缺它会直接编译不过 */
+#define CFG_NUM_SHAPES 3
 
 /* 舵机：通道由原理图固定，改 CH1/CH2 会发到没有舵机的 PB6/PB7 上。
    档位值 = 2026-09-26 台架实测定稿（机构同一套，脉宽↔角度跟舵机+机构走，与板无关）。
@@ -144,11 +161,13 @@
    → 到目标 XY、下放之前 OPEN→HALF(初步夹住) → 升降放到底 DOWN 之后才允许 CLOSE(夹紧)
    → 抬回 UP。sort_task 的投放/抓取流程照此序，别把"夹紧"提前到下放途中 */
 #define CFG_SERVO_TIM     htim4
-#define CFG_LIFT_UP_US   1150  /* 最高（抬到顶） */
-#define CFG_LIFT_DOWN_US  900  /* 最低（放到底） */
-#define CFG_CLAW_OPEN_US  1100 /* 完全张开 = 巡航安全形 = 上电位 */
-#define CFG_CLAW_CLOSE_US 1700 /* 夹紧 */
-#define CFG_CLAW_HALF_US  1600 /* 初步夹住 */
+/* ⚠️ 本文件是产品 code/Config/sort_config.h 的镜像（调试舵机档位真源在 dbg_config.h
+   §3，这里只保证两份拷贝不打架）；改产品值时同位改这里 */
+#define CFG_LIFT_UP_US   1600  /* 完全升起（到顶）——夹爪重装后三次标定：1150 → 1600 */
+#define CFG_LIFT_DOWN_US  1300 /* 完全放下（放到底）——夹爪重装后三次标定：900 → 1300 */
+#define CFG_CLAW_OPEN_US  1250 /* 完全展开 = 巡航安全形 = 上电位 —— 夹爪重装后三次标定：1100 → 1250 */
+#define CFG_CLAW_CLOSE_US 1950 /* 兜底夹紧（形状 0）——夹爪重装后三次标定：1750 → 1950；与产品同值 */
+#define CFG_CLAW_HALF_US  1750 /* 兜底初夹（形状 0，作废轻放同值）——夹爪重装后三次标定：1600 → 1750 */
 #define CFG_SERVO_MOVE_MS 400
 #define CFG_CLAW_CLOSE_MS 600
 

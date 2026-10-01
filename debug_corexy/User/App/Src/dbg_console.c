@@ -10,8 +10,10 @@
 #include "dbg_print.h"
 #include "dbg_uart.h"
 #include "dbg_app.h"
+#include "dbg_vision.h"
 #include "servo_out.h"
-#include "sort_config.h" /* CFG_TRAY_BINS：tb 的盒号范围 */
+#include "sort_config.h" /* CFG_TRAY_BINS：tb 的盒号范围；CFG_NUM_CATEGORIES/TJC_*：屏自检 */
+#include "tjc_screen.h"
 #include "zdt_bus.h"
 
 /* 分词上限：`send` 一帧最多 32 字节 = 32 个 token + 命令名，留够余量 */
@@ -406,6 +408,14 @@ static uint8_t Dbg_Cmd_Home(char *tok[], uint8_t n, uint8_t axis_y) {
     return axis_y ? Dbg_App_HomeY((uint16_t)speed) : Dbg_App_HomeX((uint16_t)speed);
 }
 
+/* 一键全回零：homex → homey → thome（= 产品上电自动归零的同一步；上电默认自动跑，
+   3s 内任意键跳过；单轴命令保留用于单独排查） */
+static uint8_t Dbg_Cmd_HomeAll(char *tok[], uint8_t n) {
+    (void)tok;
+    (void)n;
+    return Dbg_App_HomeAll();
+}
+
 static uint8_t Dbg_Cmd_Homey(char *tok[], uint8_t n) {
     return Dbg_Cmd_Home(tok, n, 1u);
 }
@@ -441,18 +451,18 @@ static uint8_t Dbg_Cmd_Drop(char *tok[], uint8_t n) {
 }
 
 static uint8_t Dbg_Cmd_Tb(char *tok[], uint8_t n) {
-    int32_t bin = 0;
+    int32_t cat = 0;
 
     if (n < 2u) {
         Dbg_App_TrayPrint();
         return 1u;
     }
-    if (Dbg_Cmd_ParseI32(tok[1], &bin) == 0u) {
-        Dbg_Printf("[FAIL] 用法：tb（打印转盘记账）/ tb <盒号0~%u>\n",
-                   (unsigned)(CFG_TRAY_BINS - 1u));
+    if ((Dbg_Cmd_ParseI32(tok[1], &cat) == 0u) || (cat < 1) || (cat > (int)CFG_NUM_CATEGORIES)) {
+        Dbg_Printf("[FAIL] 用法：tb（打印转盘记账）/ tb <类别1~%u>（类别号直对盒号，一句到位）\n",
+                   (unsigned)CFG_NUM_CATEGORIES);
         return 0u;
     }
-    return Dbg_App_TrayGotoBin((uint8_t)bin);
+    return Dbg_App_TrayGotoCategory((uint8_t)cat);
 }
 
 static uint8_t Dbg_Cmd_Cal(char *tok[], uint8_t n) {
@@ -910,28 +920,226 @@ static uint8_t Dbg_Cmd_Lim(char *tok[], uint8_t n) {
     return 1u;
 }
 
-/* ★ 抓取全流程：pick=原地爪时序；pick <X> <Y> [mm/s]=先定位（需先归零）再走爪时序 */
+/* ★ 抓取全流程：pick=原地爪时序；pick <X> <Y> [mm/s [形状0~3]]=先定位（需先归零）再走爪时序 */
 static uint8_t Dbg_Cmd_Pick(char *tok[], uint8_t n) {
-    int32_t ix = 0;
-    int32_t iy = 0;
+    int32_t  ix    = 0;
+    int32_t  iy    = 0;
+    int32_t  sp    = 0;
+    uint16_t shape = 0u; /* 缺省 0 = 默认方案 */
+    uint8_t  ok    = 0u;
 
-    if (n >= 3u) {
-        if ((Dbg_Cmd_ParseI32(tok[1], &ix) == 0u) || (Dbg_Cmd_ParseI32(tok[2], &iy) == 0u)) {
-            Dbg_Printf("[FAIL] 用法：pick / pick <X> <Y> [mm/s]\n");
+    if (n >= 5u) { /* tok[4] = 形状：pick <X> <Y> <mm/s> <形状> 共 5 个 token */
+        shape = Dbg_Cmd_ParseU16(tok[4], &ok);
+        if ((ok == 0u) || (shape > (uint16_t)CFG_NUM_SHAPES)) {
+            Dbg_Printf("[FAIL] 形状参 0~%u（缺省 0=默认方案；1=立方体 2=12面体 3=六棱柱）\n",
+                       (unsigned)CFG_NUM_SHAPES);
             return 0u;
         }
-        if (n >= 4u) {
-            int32_t sp = 0;
+    }
+    if (n >= 3u) {
+        if ((Dbg_Cmd_ParseI32(tok[1], &ix) == 0u) || (Dbg_Cmd_ParseI32(tok[2], &iy) == 0u)) {
+            Dbg_Printf("[FAIL] 用法：pick / pick <X> <Y> [mm/s [形状0~3]]\n");
+            return 0u;
+        }
+        if ((n >= 4u) && ((Dbg_Cmd_ParseI32(tok[3], &sp) == 0u) || (sp < 0))) {
+            Dbg_Printf("[FAIL] 速度不合法\n");
+            return 0u;
+        }
+        return Dbg_App_Pick((float)ix, (float)iy, (uint16_t)sp, 1u, (uint8_t)shape);
+    }
+    return Dbg_App_Pick(0.0f, 0.0f, 0u, 0u, (uint8_t)shape);
+}
 
-            if ((Dbg_Cmd_ParseI32(tok[3], &sp) == 0u) || (sp < 0)) {
-                Dbg_Printf("[FAIL] 速度不合法\n");
+/* ---------------- 视觉链路 / 串口屏（2026-10-01 接入 USART2/USART6） ---------------- */
+
+/* TJC 控件名长度校验：tjc_screen.c 的缓冲按 CFG_TJC_NAME_MAX 编译期定死，超长名必须在这里拦下 */
+static uint8_t Dbg_Cmd_ValidName(const char *s) {
+    uint8_t len = 0u;
+
+    while (s[len] != '\0') {
+        len++;
+        if (len > (uint8_t)CFG_TJC_NAME_MAX) {
+            return 0u;
+        }
+    }
+    return (len > 0u) ? 1u : 0u;
+}
+
+/* 行号（=类别 ID）-> 屏上计数控件名："n"+数字，同产品 display_task.c 的 Display_CountVarName */
+static void Dbg_Cmd_CntName(uint8_t row, char *out) {
+    const char *base = CFG_TJC_VAR_CNT_BASE;
+    uint32_t    val  = (uint32_t)CFG_TJC_CNT_FIRST + (uint32_t)(row - 1u);
+    char        num[4];
+    uint8_t     len = 0u;
+    uint8_t     n   = 0u;
+
+    while ((base[len] != '\0') && (len < (uint8_t)CFG_TJC_NAME_MAX)) {
+        out[len] = base[len];
+        len++;
+    }
+    do {
+        num[n++] = (char)('0' + (val % 10u));
+        val /= 10u;
+    } while ((val > 0u) && (n < (uint8_t)sizeof(num)));
+    while ((n > 0u) && (len < (uint8_t)CFG_TJC_NAME_MAX)) {
+        out[len++] = num[--n];
+    }
+    out[len] = '\0';
+}
+
+/* k230 [clr | live [秒] | sim <类别1~6> <x_mm> <y_mm> [形状0~3]]；不带参数 = 打印快照 */
+static uint8_t Dbg_Cmd_K230(char *tok[], uint8_t n) {
+    if (n >= 2u) {
+        if (Dbg_Cmd_StrEq(tok[1], "clr") != 0u) {
+            Dbg_Vision_Flush();
+            Dbg_Printf("[OK] 视觉缓存与收帧计数已清（`k230` 重新看快照）\n");
+            return 1u;
+        }
+        if (Dbg_Cmd_StrEq(tok[1], "live") != 0u) {
+            uint32_t secs = 10u;
+
+            if (n >= 3u) {
+                int32_t v = 0;
+
+                if ((Dbg_Cmd_ParseI32(tok[2], &v) == 0u) || (v < 1u) || (v > 120u)) {
+                    Dbg_Printf("[FAIL] 用法：k230 live [秒]（1~120，缺省 10）\n");
+                    return 0u;
+                }
+                secs = (uint32_t)v;
+            }
+            return Dbg_Vision_Live(secs);
+        }
+        if (Dbg_Cmd_StrEq(tok[1], "sim") != 0u) {
+            uint8_t  ok    = 0u;
+            uint16_t cat   = 0u;
+            int32_t  x     = 0;
+            int32_t  y     = 0;
+            uint16_t shape = 0u; /* 缺省 0 = 默认方案；给 4+ 故意放行，可用来验"形状越界=不可用" */
+
+            if ((n < 5u) || ((cat = Dbg_Cmd_ParseU16(tok[2], &ok), (ok == 0u) || (cat < 1u) ||
+                             (cat > (uint16_t)CFG_NUM_CATEGORIES))) ||
+                (Dbg_Cmd_ParseI32(tok[3], &x) == 0u) || (Dbg_Cmd_ParseI32(tok[4], &y) == 0u)) {
+                Dbg_Printf("[FAIL] 用法：k230 sim <类别1~6> <x_mm> <y_mm> [形状0~3]"
+                           "（本地合成一帧喂进解析器，验解析->缓存->换算，不接线也能测）\n");
                 return 0u;
             }
-            return Dbg_App_Pick((float)ix, (float)iy, (uint16_t)sp, 1u);
+            if (n >= 6u) {
+                shape = Dbg_Cmd_ParseU16(tok[5], &ok);
+                if (ok == 0u) {
+                    Dbg_Printf("[FAIL] 形状参数须为数字（0~3 = 正常路径；4+ 故意放行，可验越界=不可用）\n");
+                    return 0u;
+                }
+            }
+            Dbg_Vision_SimFeed((uint8_t)cat, (uint8_t)shape, (float)x, (float)y);
+            return 1u;
         }
-        return Dbg_App_Pick((float)ix, (float)iy, 0u, 1u);
+        Dbg_Printf("[FAIL] 用法：k230 / k230 clr / k230 live [秒] / k230 sim <类别> <x> <y> [形状]\n");
+        return 0u;
     }
-    return Dbg_App_Pick(0.0f, 0.0f, 0u, 0u);
+    Dbg_Vision_Print();
+    return 1u;
+}
+
+/* scr <控件名> <数值>：发 控件名.val=数值 + FF FF FF（同产品写"成功数量"的那条指令） */
+static uint8_t Dbg_Cmd_ScrVal(char *tok[], uint8_t n) {
+    int32_t val = 0;
+
+    if ((n < 3u) || (Dbg_Cmd_ValidName(tok[1]) == 0u) || (Dbg_Cmd_ParseI32(tok[2], &val) == 0u)) {
+        Dbg_Printf("[FAIL] 用法：scr <控件名> <数值>（如 scr n1 5；控件名最长 %u 字符）\n",
+                   (unsigned)CFG_TJC_NAME_MAX);
+        return 0u;
+    }
+    if (Tjc_SetVal(tok[1], val) == 0u) {
+        Dbg_Printf("[FAIL] USART6 发送失败（外设没使能/超时）\n");
+        return 0u;
+    }
+    Dbg_Printf("[OK] 已发 %s.val=%d + FFFFFF —— 屏上该控件数字应变为 %d；没变 = 控件名不存在或屏端波特率不是 115200\n",
+               tok[1], (int)val, (int)val);
+    return 1u;
+}
+
+/* scrp <控件名> <图片号>：发 控件名.pic=图片号（整图切换） */
+static uint8_t Dbg_Cmd_ScrPic(char *tok[], uint8_t n) {
+    int32_t pic = 0;
+
+    if ((n < 3u) || (Dbg_Cmd_ValidName(tok[1]) == 0u) || (Dbg_Cmd_ParseI32(tok[2], &pic) == 0u)) {
+        Dbg_Printf("[FAIL] 用法：scrp <控件名> <图片号>\n");
+        return 0u;
+    }
+    if (Tjc_SetPic(tok[1], pic) == 0u) {
+        Dbg_Printf("[FAIL] USART6 发送失败（外设没使能/超时）\n");
+        return 0u;
+    }
+    Dbg_Printf("[OK] 已发 %s.pic=%d + FFFFFF\n", tok[1], (int)pic);
+    return 1u;
+}
+
+/* scrt <控件名> <文本...>：发 控件名.txt="文本"（多词自动用空格拼回一句） */
+static uint8_t Dbg_Cmd_ScrText(char *tok[], uint8_t n) {
+    char     text[48];
+    uint16_t len = 0u;
+
+    if ((n < 3u) || (Dbg_Cmd_ValidName(tok[1]) == 0u)) {
+        Dbg_Printf("[FAIL] 用法：scrt <控件名> <文本...>\n");
+        return 0u;
+    }
+    for (uint8_t i = 2u; i < n; i++) {
+        const char *s = tok[i];
+
+        if (i > 2u) {
+            if (len < (uint16_t)(sizeof(text) - 1u)) {
+                text[len++] = ' ';
+            }
+        }
+        while ((*s != '\0') && (len < (uint16_t)(sizeof(text) - 1u))) {
+            text[len++] = *s++;
+        }
+    }
+    text[len] = '\0';
+
+    if (Tjc_SetText(tok[1], text) == 0u) {
+        Dbg_Printf("[FAIL] USART6 发送失败（外设没使能/超时）\n");
+        return 0u;
+    }
+    Dbg_Printf("[OK] 已发 %s.txt=\"%s\" + FFFFFF\n", tok[1], text);
+    return 1u;
+}
+
+/* scrtest [0]：把 6 行计数控件分别写 1..6（= 产品上电自检宏 CFG_TJC_SELFTEST_ON_BOOT 的台架版）。
+   判据：屏上"成功数量"列自上而下 1,2,3,4,5,6 = 控件名+行序+USART6 链路全对；
+   某行没动 = 那个控件名在屏工程里不存在（静默失败，别处查不出来）。
+   `scrtest 0` 写全 0（恢复干净画面） */
+static uint8_t Dbg_Cmd_ScrTest(char *tok[], uint8_t n) {
+    uint8_t zero = (n >= 2u) && (Dbg_Cmd_StrEq(tok[1], "0") != 0u);
+    uint8_t ok   = 1u;
+
+    for (uint8_t row = 1u; row <= (uint8_t)CFG_NUM_CATEGORIES; row++) {
+        char name[(uint8_t)CFG_TJC_NAME_MAX + 1u];
+
+        Dbg_Cmd_CntName(row, name);
+        ok &= Tjc_SetVal(name, zero ? 0 : (int32_t)row);
+    }
+    if (ok == 0u) {
+        Dbg_Printf("[FAIL] 有指令没发出去（USART6 检查接线/波特率）\n");
+        return 0u;
+    }
+    Dbg_Printf("[OK] %s 已发：屏上 6 行应%s（1,2,3,4,5,6 = 控件名/行序/链路全对；某行不动 = 该控件名不存在）\n",
+               zero ? "n1~n6=0" : "n1~n6=1..6", zero ? "全部归 0" : "自上而下显示 1~6");
+    return 1u;
+}
+
+/* read [等待s]：到读帧位（投放点上方）再取视觉目标——产品读帧纪律的台架版。
+   归零/待机位正压托盘上方挡相机，那时的坐标不可信；作为抓取依据的坐标必须出自这里 */
+static uint8_t Dbg_Cmd_Read(char *tok[], uint8_t n) {
+    int32_t s = 0;
+
+    if (n >= 2u) {
+        if ((Dbg_Cmd_ParseI32(tok[1], &s) == 0u) || (s < 0u) || (s > 120u)) {
+            Dbg_Printf("[FAIL] 用法：read [等待秒]（1~120，缺省 10；任意键中止）\n");
+            return 0u;
+        }
+    }
+    return Dbg_App_ReadTarget((uint16_t)s);
 }
 
 static uint8_t Dbg_Cmd_Help(char *tok[], uint8_t n);
@@ -951,14 +1159,15 @@ static const Dbg_Cmd_t s_cmd[] = {
     {"sq", "<mm> [mm/s]", "方块测试 X+ Y+ X- Y-", Dbg_Cmd_Sq},
     {"p", "<X> <Y> [mm/s]", "★绝对定位到第三象限坐标（负数；先归零；p 打印当前位置）", Dbg_Cmd_P},
     {"drop", "[mm/s]", "★一键到投放点（坐标=dbg_config.h §4c；需先归零）", Dbg_Cmd_Drop},
+    {"home", "", "★一键全回零：homex→homey→thome（=产品上电自动归零；上电默认自动跑，3s内任意键跳过）", Dbg_Cmd_HomeAll},
     {"homey", "[mm/s]", "★Y 轴回零演练：向最大端(Y+)走，限位裸沿触发即停+电平复核+退离；任意键=软急停", Dbg_Cmd_Homey},
     {"homex", "[mm/s]", "★X 轴回零演练：向最大端(X+)走，限位裸沿触发即停+电平复核+退离；任意键=软急停", Dbg_Cmd_Homex},
     {"thome", "[粗寻标rpm]", "★转盘回零（四相，对齐产品）：凸块退出→粗寻标→反向脱开→慢压定零；走通=原点开关PB0校准正确", Dbg_Cmd_Thome},
-    {"tb", "[盒号0~5]", "★转盘对格：单向正转 steps×每格脉冲@60rpm，走完双复核（索引沿+脉冲折算盒号）；tb=打印记账", Dbg_Cmd_Tb},
+    {"tb", "[类别1~6]", "★转盘对格一句到位：tb <类别号>=转到该类别的盒（盒1=回零位那格，映射 dbg_config §4d）；tb=打印记账", Dbg_Cmd_Tb},
     {"cal", "<mm> [pulses/mm]", "标定位移（只用 X 方向）", Dbg_Cmd_Cal},
     {"g", "<0开|1紧|2初夹>", "夹爪档位（巡航必须 0=全开；紧=放到底之后才允许）", Dbg_Cmd_G},
     {"l", "<0抬|1伸>", "升降档位（0=最高 1=最低）", Dbg_Cmd_L},
-    {"pick", "[X Y [mm/s]]", "★抓取全流程：张开→[定位]→初夹→下放→夹紧→抬回（带坐标需先归零）", Dbg_Cmd_Pick},
+    {"pick", "[X Y [mm/s [形状0~3]]]", "★抓取全流程：张开→[定位]→初夹→下放→夹紧→抬回；形状选夹持方案（缺省0=默认；1立方体 2十二面体 3六棱柱）", Dbg_Cmd_Pick},
     {"raw", "<claw|lift> <us>", "舵机原始脉宽（扫行程用）", Dbg_Cmd_Raw},
     {"sstop", "<claw|lift>", "停该路舵机 PWM（顶死/发烫时的第一反应）", Dbg_Cmd_Sstop},
     {"scan", "[最大ID]", "★A/B/T 三条线逐 ID 试使能+收回包，找出各自驱动器地址", Dbg_Cmd_Scan},
@@ -971,9 +1180,15 @@ static const Dbg_Cmd_t s_cmd[] = {
     {"send", "[a|b|t] <hex...>", "★原样发一段十六进制到指定线（默认 a；并打回包）", Dbg_Cmd_Send},
     {"spu", "[1|10]", "★速度字段系数：1=字段即RPM 10=字段是0.1RPM", Dbg_Cmd_Spu},
     {"tspu", "[1|10]", "★转盘速度系数（与 spu 独立）；同时缩放转盘所有等待超时", Dbg_Cmd_Tspu},
-    {"tspd", "<20~400>", "★转盘节拍百分比（100=产品标定；想快一倍用 200）", Dbg_Cmd_Tspd},
+    {"tspd", "<20~400>", "★转盘节拍百分比（默认 400 = 产品当前标定 480/240/120rpm；丢步就回 200）", Dbg_Cmd_Tspd},
     {"fmt", "<13|16>", "★位置帧格式：16=V2说明书(0.1°/0.1RPM) 13=老协议(脉冲/RPM)", Dbg_Cmd_Fmt},
     {"lim", "[clr]", "★限位/原点开关：电平 + 按压计数（消抖+闩锁，只认压下；clr 清零）", Dbg_Cmd_Lim},
+    {"k230", "[clr|live [s]|sim 类 x y [形状]]", "★视觉链路(USART2)：快照+换算 / 清缓存 / 实时流(任意键停) / 本地注帧(形状0~3缺省0)", Dbg_Cmd_K230},
+    {"read", "[等待s]", "★到读帧位再取目标：goto投放点+静默+清缓存+等新鲜帧，给出 pick 坐标（抓取依据必须出自它）", Dbg_Cmd_Read},
+    {"scr", "<控件名> <数值>", "★屏(USART6)：发 控件名.val=数值+FFFFFF（如 scr n1 5）", Dbg_Cmd_ScrVal},
+    {"scrp", "<控件名> <图片号>", "★屏：发 控件名.pic=图片号（整图切换）", Dbg_Cmd_ScrPic},
+    {"scrt", "<控件名> <文本...>", "★屏：发 控件名.txt=\"文本\"", Dbg_Cmd_ScrText},
+    {"scrtest", "[0]", "★屏自检：n1~n6 写 1~6（全亮=控件名/行序/链路对）；scrtest 0 清零", Dbg_Cmd_ScrTest},
     {"cfg", "", "打印配置（含待核实项）", Dbg_Cmd_Cfg},
     {"rst", "", "★软复位：重跑上电自检（不用手按复位键）", Dbg_Cmd_Rst},
     {"stat", "", "状态汇总", Dbg_Cmd_Stat},

@@ -63,9 +63,10 @@ uint8_t Kinematics_TrayBinOf(uint32_t pulses) {
 }
 
 uint8_t Kinematics_XyInEnvelope(float x_mm, float y_mm) {
-    /* 必须"两个都成立才放行"：写成"任一不成立则拒绝"时 NaN 会让两侧比较同时为假 */
-    if (x_mm >= CFG_WORK_MIN_MM && x_mm <= CFG_WORK_MAX_X_MM && y_mm >= CFG_WORK_MIN_MM &&
-        y_mm <= CFG_WORK_MAX_Y_MM) {
+    /* 必须"两个都成立才放行"：写成"任一不成立则拒绝"时 NaN 会让两侧比较同时为假。
+       2026-10-01 起工作包络 = 台架同框第三象限：X ∈ [-135, 0]、Y ∈ [-187, 0] */
+    if (x_mm >= CFG_WORK_X_MIN_MM && x_mm <= CFG_WORK_X_MAX_MM && y_mm >= CFG_WORK_Y_MIN_MM &&
+        y_mm <= CFG_WORK_Y_MAX_MM) {
         return 1u;
     }
     return 0u;

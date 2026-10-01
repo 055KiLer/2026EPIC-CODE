@@ -1,7 +1,8 @@
 /**
  * @file    zdt_motor.h
- * @brief   ZDT 张大头闭环步进电机驱动（Device 层，协议见电控文档 §4.4）
- * @note    主控只发不收，无到位反馈；speed 与 pulse 均为「电机轴」口径，
+ * @brief   ZDT 张大头闭环步进电机驱动（Device 层，协议见电控文档 §4.3）
+ * @note    主控只发不收（本批驱动器对广播不回包，台架 2026-09-30 定稿），
+ *          无到位反馈；speed 与 pulse 均为「电机轴」口径，
  *          带减速箱时换算只体现在 pulse 里
  */
 #ifndef __ZDT_MOTOR_H
@@ -21,23 +22,8 @@ typedef enum {
     ZDT_DIR_CCW = 0x01
 } Zdt_DIR_e;
 
-/* Zdt_Probe 的返回值（驱动器应答见 zdt_motor.c 的说明） */
-typedef enum {
-    ZDT_PROBE_OK = 1,        /* 回了 02：命令已正确接收 */
-    ZDT_PROBE_NO_REPLY = 0,  /* 一个字节都没有：数据线/地址/波特率/供电 */
-    ZDT_PROBE_REJECT = -1    /* 回了 EE/E2 或非标准字节：被拒（控制模式=脉冲+方向、校验、参数） */
-} Zdt_Probe_e;
-
-/* 上电时序第一步：依次使能三台 */
+/* 上电时序第一步：依次使能三台（只发不收；使能帧不含运动指令，电机不会走） */
 void Zdt_Init(void);
-
-/**
- * @brief  驱动器自检：发使能帧并读回包（不含运动指令，电机不会走）
- * @param  timeout_ms 等回包的时长（台架实测回包通常 <2ms）
- * @note   用途：上电时判"这一路驱动器在不在、收不收"。两种静默失效只有它能发现：
- *         ① 完全不应答（数据线/地址/波特率）② 只应答不执行运动（控制模式=脉冲+方向）
- */
-Zdt_Probe_e Zdt_Probe(Zdt_ID_e id, uint32_t timeout_ms);
 
 /* 以下均返回 1=帧已发出  0=发送失败（电机不会动，调用方须作废记账） */
 uint8_t Zdt_Enable(Zdt_ID_e id, uint8_t enable);

@@ -6,25 +6,24 @@
 #include "bsp_gpio.h"
 #include "sort_config.h"
 
-/* 一整圈最少数秒，20ms 内的重复上升沿只能是触点弹跳 */
-#define TRAY_INDEX_DEBOUNCE_MS 20u
-
-/* ★ X/Y 限位消抖 + 按压闩锁（2026-09-28 自台架 dbg_gpio 移植，实测依据）：
+/* ★ 消抖 + 按压闩锁（2026-09-28 自台架 dbg_gpio 移植，实测依据；2026-10-01 起转盘
+   索引沿也用同款两道门，对齐台架验证过的实现）：
    单次按压产生 17~128 个沿、松开瞬间也能蹦 61 沿（弱上拉天线效应+触点弹跳），
-   裸沿锁存会把"松开"判成"又撞了"→ 误触发急停 + 作废记账。
+   裸沿锁存会把"松开"判成"又撞了"→ 误触发急停 + 作废记账；转盘侧则是弹跳沿灌进
+   整圈核对，把正常定位误判成丢步。
    两道门：①CFG_LIMIT_DEBOUNCE_MS 内只认一个沿 ②必须先由 Bsp_Gpio_Poll 确认
-   "连续 40ms 松开"才武装下一次按压判定（转盘索引沿已有 20ms 消抖，不在此列） */
+   "连续 40ms 松开"才武装下一次按压判定。真索引沿 ≥ 一圈(9.4s)一次，两道门不漏真沿 */
 typedef struct {
-    volatile uint8_t  armed;       /* 1 = 已确认松开，下一个被认可的下降沿才算撞限位 */
+    volatile uint8_t  armed;       /* 1 = 已确认松开，下一个被认可的下降沿才算数 */
     volatile uint32_t last_accept; /* 上一次被认可的沿时刻 */
     volatile uint32_t idle_since;  /* 电平连续为"松开"的起始时刻（0 = 此刻压着） */
 } Bsp_LimDbc_t;
 
 static volatile uint32_t s_events;
 static volatile uint32_t s_tray_index_cnt;
-static volatile uint32_t s_tray_index_tick;
 static Bsp_LimDbc_t s_lim_x;
 static Bsp_LimDbc_t s_lim_y;
+static Bsp_LimDbc_t s_tray_idx;
 
 uint8_t Bsp_Gpio_LimitX(void) {
     uint8_t active = (HAL_GPIO_ReadPin(CFG_LIMIT_GPIO_X, CFG_LIMIT_PIN_X) == CFG_LIMIT_ACTIVE_LEVEL);
@@ -66,9 +65,10 @@ uint32_t Bsp_Gpio_TrayIndexCount(void) {
 void Bsp_Gpio_Poll(void) {
     uint32_t now = HAL_GetTick();
 
-    for (uint8_t i = 0u; i < 2u; i++) {
-        Bsp_LimDbc_t *st   = (i == 0u) ? &s_lim_x : &s_lim_y;
-        uint8_t       active = (i == 0u) ? Bsp_Gpio_LimitX() : Bsp_Gpio_LimitY();
+    for (uint8_t i = 0u; i < 3u; i++) {
+        Bsp_LimDbc_t *st = (i == 0u) ? &s_lim_x : ((i == 1u) ? &s_lim_y : &s_tray_idx);
+        uint8_t active =
+            (i == 0u) ? Bsp_Gpio_LimitX() : ((i == 1u) ? Bsp_Gpio_LimitY() : Bsp_Gpio_TrayOrigin());
 
         if (active != 0u) {
             st->idle_since = 0u;
@@ -103,13 +103,19 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin) {
         st->armed       = 0u;
         s_events |= BSP_GPIO_EVT_XY_LIMIT;
     } else if (GPIO_Pin == CFG_ORIGIN_PIN_TRAY) {
-        /* 弹跳灌进第二次沿，App 的整圈核对就永远对不上，每次定位都会被误判成丢步 */
-        uint32_t now = HAL_GetTick();
+        /* 弹跳灌进第二次沿，App 的整圈核对就永远对不上，每次定位都会被误判成丢步
+           ——与 X/Y 同款两道门（台架 dbg_gpio 同构，见文件头实测依据） */
+        Bsp_LimDbc_t *st  = &s_tray_idx;
+        uint32_t      now = HAL_GetTick();
 
-        if ((now - s_tray_index_tick) < TRAY_INDEX_DEBOUNCE_MS) {
+        if (st->armed == 0u) {
             return;
         }
-        s_tray_index_tick = now;
+        if ((now - st->last_accept) < CFG_LIMIT_DEBOUNCE_MS) {
+            return;
+        }
+        st->last_accept = now;
+        st->armed       = 0u;
         s_tray_index_cnt++;
         s_events |= BSP_GPIO_EVT_TRAY_INDEX;
     }

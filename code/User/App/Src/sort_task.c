@@ -29,6 +29,15 @@ static const uint8_t s_category_to_bin[CFG_NUM_CATEGORIES] = {
     0u, 1u, 2u, 3u, 4u, 5u,
 };
 
+/* 形状 -> 夹持方案：**形状 0 = 默认方案**（不在三种特调之内，直接用兜底 CFG_CLAW_* 值）；
+ * 形状 1~3 = 三种特调（1=立方体、2=12面体、3=六棱柱），下标 = 形状 - 1。
+ * 形状**不参与分类**（进哪个盒只由类别定），只决定夹爪的初夹/夹紧角度。
+ * 数值在 sort_config.h 的 CFG_GRIP_*（标定只改配置）；★2026-10-01 已按形状逐套实测定稿
+ * （不再是三种形状的折中值）。
+ * 下标无需再做范围判断：形状已被 vision_task 校验为 0~3，越界帧根本进不来 */
+static const uint16_t s_grip_half_us[CFG_NUM_SHAPES]  = CFG_GRIP_HALF_US;
+static const uint16_t s_grip_close_us[CFG_NUM_SHAPES] = CFG_GRIP_CLOSE_US;
+
 /* 只有投放成功才 ++，所以屏上 6 行计数之和永远等于真实件数（丢一件会被判成计数错误）；
    同时它单调递增，既当 display 回执握手的序号，也当 display 侧"这一件是否已计数"的去重凭据 */
 static uint16_t s_total = 0u;
@@ -40,26 +49,41 @@ static uint8_t Sort_Goto(float x_mm, float y_mm) {
     return Motion_MoveXYBlocking(x_mm, y_mm, CFG_XY_SPEED_MM_S);
 }
 
-/* 张爪必须是显式一步：Sort_Drop 收尾把爪子闭合在抬升位，若这里直接下伸闭合，
-   等于对着货物合上一次已经合上的夹爪，第一件之后每件都抓空 */
-static void Sort_Grab(void) {
+/* 张爪必须是显式一步：进抓取序先把爪张到全开巡航形——直接下伸闭合等于对着货物合爪、
+   必然抓空。入口不变量 = 爪已全开（投放/轻放收尾、上电位都是全开），这一步是兜底重申。
+   初夹/夹紧的脉宽按**形状**选：0 = 默认方案（兜底值），1~3 = 特调方案查表
+   （形状已被 vision_task 校验为 0~3） */
+static void Sort_Grab(uint8_t shape) {
+    uint16_t half_us  = (shape == 0u) ? (uint16_t)CFG_CLAW_HALF_US
+                                      : s_grip_half_us[shape - 1u];
+    uint16_t close_us = (shape == 0u) ? (uint16_t)CFG_CLAW_CLOSE_US
+                                      : s_grip_close_us[shape - 1u];
+
     Servo_ClawSet(SERVO_CLAW_OPEN);
     vTaskDelay(pdMS_TO_TICKS(CFG_SERVO_MOVE_MS));
-    Servo_LiftSet(SERVO_LIFT_DOWN);
+    /* ★ 到目标 XY、下放之前先初步夹住（台架 pick 定稿序，sort_config.h 抓取时序硬约束）：
+       对着物块直接合到夹紧会把块顶歪/顶飞，先初夹轻接触再下放夹紧 */
+    Servo_ClawSetUs(half_us);
     vTaskDelay(pdMS_TO_TICKS(CFG_SERVO_MOVE_MS));
-    Servo_ClawSet(SERVO_CLAW_CLOSE);
+    Servo_LiftSet(SERVO_LIFT_DOWN);
+    /* 升降行程比换档慢，等待给双倍（台架定稿）：没放到底就夹紧会顶死 */
+    vTaskDelay(pdMS_TO_TICKS(CFG_SERVO_MOVE_MS * 2u));
+    Servo_ClawSetUs(close_us);
     vTaskDelay(pdMS_TO_TICKS(CFG_CLAW_CLOSE_MS));
     Servo_LiftSet(SERVO_LIFT_UP);
     vTaskDelay(pdMS_TO_TICKS(CFG_SERVO_MOVE_MS));
 }
 
-/* 轻放（下伸 -> 半开 -> 抬升）：只用于"作废时就地把货交还台面" */
+/* 轻放（下伸 -> 半开松爪 -> 抬升 -> 回全开）：只用于"作废时就地把货交还台面"。
+   收尾必须回全开：之后龙门还要平移，半开的爪一样会扫到托盘边/旁边物块（巡航全开硬约束） */
 static void Sort_PlaceSoft(void) {
     Servo_LiftSet(SERVO_LIFT_DOWN);
     vTaskDelay(pdMS_TO_TICKS(CFG_SERVO_MOVE_MS));
     Servo_ClawSet(SERVO_CLAW_HALF);
     vTaskDelay(pdMS_TO_TICKS(CFG_SERVO_MOVE_MS));
     Servo_LiftSet(SERVO_LIFT_UP);
+    vTaskDelay(pdMS_TO_TICKS(CFG_SERVO_MOVE_MS));
+    Servo_ClawSet(SERVO_CLAW_OPEN);
     vTaskDelay(pdMS_TO_TICKS(CFG_SERVO_MOVE_MS));
 }
 
@@ -73,11 +97,12 @@ static void Sort_ReleaseIfHolding(uint8_t *loaded) {
     *loaded = 0u;
 }
 
-/* 投放：抬升位直接张开松爪，落格后回闭合。不读码（货物顶面二维码属模拟污渍） */
+/* 投放：抬升位直接张开松爪，松爪后**保持全开**（2026-10-01 用户口径：投放后回闭合，
+   龙门平移去抓下一件时闭合的爪会撞托盘边/旁边物块——巡航全开是机构硬约束；
+   下一件 Sort_Grab 第一步本来就要先张爪，这里不闭合正好衔接上）。
+   不读码（货物顶面二维码属模拟污渍） */
 static void Sort_Drop(void) {
     Servo_ClawSet(SERVO_CLAW_OPEN);
-    vTaskDelay(pdMS_TO_TICKS(CFG_SERVO_MOVE_MS));
-    Servo_ClawSet(SERVO_CLAW_CLOSE);
     vTaskDelay(pdMS_TO_TICKS(CFG_SERVO_MOVE_MS));
 }
 
@@ -154,6 +179,17 @@ static uint8_t Sort_DoCycle(const K230_Target_t *target) {
 
     Vision_ToMachine(target, &target_x, &target_y);
 
+    /* ★ 夹爪延伸夹取带（2026-10-01 台架口径）：物块可出现在 X ∈ [CLAMP, X_MIN)——龙门停在
+       X_MIN 时夹爪构造仍够得着。目标 X 超出软限位就**钳位到 X_MIN 就近夹取**；比 CLAMP
+       还远的作废本件（转盘还没动、爪未动，无在途动作需要 settle）。⚠️ 上位机会持续重报
+       同一目标 → 会反复尝试同一件：这是"看得见够不着"的可见故障，好过静默抓空计虚数 */
+    if (target_x < CFG_WORK_X_MIN_MM) {
+        if (target_x < CFG_XY_X_CLAMP_MM) {
+            return 0u;
+        }
+        target_x = CFG_WORK_X_MIN_MM;
+    }
+
     /* 步骤2+3：转盘预定位（异步）与 XY 移动并行，谁慢等谁 */
     uint32_t tray_est_ms = Motion_TrayGotoBin(bin);
 
@@ -167,8 +203,8 @@ static uint8_t Sort_DoCycle(const K230_Target_t *target) {
         return 0u;
     }
 
-    /* 步骤4：抓取（不装到位开关，抓空风险 R5 已接受） */
-    Sort_Grab();
+    /* 步骤4：抓取（按形状选夹持方案；不装到位开关，抓空风险 R5 已接受） */
+    Sort_Grab(target->shape);
     loaded = 1u;
 
     /* 步骤6：投放（落差由机械侧转盘格兜底，R1）。

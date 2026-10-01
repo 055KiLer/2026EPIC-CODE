@@ -29,11 +29,13 @@ static Vision_Cache_t s_cache;
 static void Vision_UpdateCache(K230_Event_e event, const K230_Target_t *frame) {
     uint32_t now = HAL_GetTick();
 
-    /* 类别 ID 越界、或形状保留字节非 0 = 视觉与主控的口径不一致（典型：旧"颜色+形状"编码
-       没换），此时既没有正确的类别也没有正确的盒号，按"本帧无目标"处理：
-       宁可少抓（表现为"链路活着但一直无目标"），绝不用取模硬套一个错误类别静默放错盒 */
+    /* 类别越界、或形状越界（0~3 之外）= 视觉与主控的口径不一致，按"本帧无目标"处理：
+       宁可少抓（表现为"链路活着但一直无目标"），绝不用取模硬套一个错误类别静默放错盒、
+       也绝不拿错误的夹持方案去夹（夹错角度 = 抓空或顶歪）。
+       形状 0 = 默认方案（不在三种特调之内），合法；越界才作废 */
     uint8_t usable = (event == K230_EV_TARGET) && (frame->category >= 1u) &&
-                     (frame->category <= (uint8_t)CFG_NUM_CATEGORIES) && (frame->shape == 0u);
+                     (frame->category <= (uint8_t)CFG_NUM_CATEGORIES) &&
+                     (frame->shape <= (uint8_t)CFG_NUM_SHAPES);
 
     taskENTER_CRITICAL();
     s_cache.frame_tick = now;

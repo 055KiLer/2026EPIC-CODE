@@ -12,6 +12,7 @@
 #include "motion_kinematics.h"
 #include "zdt_motor.h"
 #include "bsp_gpio.h"
+#include "bsp_uart.h"
 #include <FreeRTOS.h>
 #include <task.h>
 
@@ -31,37 +32,10 @@ static uint8_t  s_tray_pending_bin = 0u;
 static volatile uint8_t s_stop_xy_pending = 0u;
 static volatile uint8_t s_homing_xy       = 0u; /* 1 = 回零中：压限位是预期动作 */
 
-/* 上电自检结果：bit0=A bit1=B bit2=转盘（1 = 没通过）；未启用自检时保持 0 */
-static uint8_t s_selftest_fail_mask = 0u;
-
-/* 单台探应答。使能帧不含运动指令，电机不会走；结果只记录，不阻断启动 */
-static uint8_t Motion_ProbeAxis(Zdt_ID_e id) {
-    return (Zdt_Probe(id, CFG_SELFTEST_TIMEOUT_MS) == ZDT_PROBE_OK) ? 1u : 0u;
-}
-
-void Motion_SelfCheck(void) {
-    uint8_t mask = 0u;
-
-    if (Motion_ProbeAxis(ZDT_ID_A) == 0u) {
-        mask |= 0x01u;
-    }
-    if (Motion_ProbeAxis(ZDT_ID_B) == 0u) {
-        mask |= 0x02u;
-    }
-    if (Motion_ProbeAxis(ZDT_ID_TRAY) == 0u) {
-        mask |= 0x04u;
-    }
-
-    s_selftest_fail_mask = mask;
-}
-
-uint8_t Motion_SelfCheckOk(void) {
-    return (s_selftest_fail_mask == 0u) ? 1u : 0u;
-}
-
-uint8_t Motion_SelfCheckFailMask(void) {
-    return s_selftest_fail_mask;
-}
+/* 单台探应答的"上电自检"已整链删除（2026-10-01）：本批驱动器对**广播不回包**
+   （台架 2026-09-30 定稿，电控文档 §4.3"主控只发不收"），发使能帧等回包只会
+   永远误报失败。上电使能 = Zdt_Init 逐台发一帧使能即完事；驱动器是否真的在，
+   由回零流程和第一件分拣的自然结果暴露 */
 
 /* 两轴一起停（CoreXY 单停一轴会让龙门歪），两帧都发出才返回 1。
    两帧都是广播停（Zdt_Stop 固定广播地址）；帧间留间隔——台架实测背靠背帧会被驱动器丢 */
@@ -162,6 +136,7 @@ void Motion_SafetyTask(void *argument) {
 
     for (;;) {
         Bsp_Gpio_Poll(); /* 限位消抖/闩锁的松开确认：连续 40ms 松开才武装下一次按压判定 */
+        Bsp_Uart_Poll(); /* 视觉线噪声预算的重开试探 + UE/RE/TE 自愈（bsp_uart.c） */
         Motion_ServeEvents();
         vTaskDelay(pdMS_TO_TICKS(CFG_SAFETY_PERIOD_MS));
     }
@@ -178,12 +153,6 @@ void Motion_Init(void) {
     s_stop_xy_pending = 0u;
     s_homing_xy       = 0u;
     (void)Bsp_Gpio_TakeEvents();
-
-#if CFG_SELFTEST_ON_BOOT
-    /* 上电自检三台驱动器：只发使能帧读应答，不产生任何运动。
-       失败结果由 Motion_SelfCheckOk()/FailMask() 给显示与流程用（不在这里阻断） */
-    Motion_SelfCheck();
-#endif
 }
 
 uint8_t Motion_XyIsTrusted(void) {
@@ -349,6 +318,10 @@ uint8_t Motion_TrayHome(void) {
                 continue;
             }
             (void)Zdt_Stop(ZDT_ID_TRAY);
+            /* ★ 帧间隙纪律（2026-10-01 台架实测背靠背 ≈1.1ms 丢帧，所有同线相邻帧距
+               ≥10ms）：台架相位间靠 50ms 等待+控制台打印天然满足，产品无打印必须显式
+               给——这里漏了速度帧会被丢，回零在相位1白等一整圈才超时重试 */
+            vTaskDelay(pdMS_TO_TICKS(50u));
         }
 
         /* 1) 粗寻标：超时必须覆盖一整圈 */
@@ -364,15 +337,60 @@ uint8_t Motion_TrayHome(void) {
         vTaskDelay(pdMS_TO_TICKS(50u));
 
         /* 2) 必须反向脱开：旋转轴只有一条沿，继续正转会把它甩到开关身后，
-           慢速再压就得再等一整圈（远超 APPROACH 超时） */
-        if (!Motion_TrayMovePulses(TRAY_DIR_BACK, CFG_TRAY_BACKOFF_PULSES, CFG_TRAY_APPROACH_RPM)) {
-            return 0u;
+           慢速再压就得再等一整圈（远超 APPROACH 超时）。
+           ★ 台架实测（2026-10-01）凸块压住开关的弧宽 > 600 脉冲（1.8°）：退一份没脱开
+           就**原地再加退一份**（最多 4 份 = 7.2°），而不是作废整次尝试、害下一轮
+           "退出相+重新粗寻标"多转一整圈。
+           ★ 过冲保护（2026-10-01 二次提速后实机现象）：480rpm 撞停的过冲可能把凸块
+           直接送过开关作用弧——停车点已在开关身后、电平=松开，此时"反向退到松开"会
+           立即**假成功**，慢压相就得从另一侧追将近一整圈（用户看到的"第二圈"）。
+           处置：停车点已松开时**先反向慢转回找窗口**（上限 CFG_TRAY_REENTRY_PULSES，
+           压上即停、再走常规退出）；走满没压上 = 触发是噪声假沿（停车点其实在窗口
+           之前，回找的这一段只是把它再退远一点），直接进慢压相由正向慢压找真正的沿。
+           两条路都不需要降速 */
+        {
+            uint8_t cleared      = 0u;
+            uint8_t skip_release = 0u; /* 1 = 假沿/停在窗口前：无窗口可退出 */
+
+            if (Bsp_Gpio_TrayOrigin() == 0u) { /* 停车就已经是松开 = 不在窗口内 */
+                if (!Motion_TrayMovePulses(TRAY_DIR_BACK, CFG_TRAY_REENTRY_PULSES,
+                                           CFG_TRAY_APPROACH_RPM)) {
+                    return 0u;
+                }
+                if (Motion_WaitTrayLevel(1u, Kinematics_TrayMoveTimeMs(
+                                                 CFG_TRAY_REENTRY_PULSES,
+                                                 (float)CFG_TRAY_APPROACH_RPM)) != 0u) {
+                    (void)Zdt_Stop(ZDT_ID_TRAY); /* 回进窗口：转下面的常规退出 */
+                } else {
+                    (void)Zdt_Stop(ZDT_ID_TRAY);
+                    skip_release = 1u; /* 没找到窗口：停车点在窗口前，别在这里耗 */
+                }
+            }
+            if (skip_release == 0u) {
+                for (uint8_t k = 0u; k < 4u; k++) {
+                    if (!Motion_TrayMovePulses(TRAY_DIR_BACK, CFG_TRAY_BACKOFF_PULSES,
+                                               CFG_TRAY_APPROACH_RPM)) {
+                        return 0u;
+                    }
+                    if (!Motion_WaitTrayLevel(0u, CFG_TRAY_APPROACH_TIMEOUT_MS)) {
+                        (void)Zdt_Stop(ZDT_ID_TRAY);
+                        continue; /* 这一份没退出来，再加退一份 */
+                    }
+                    (void)Zdt_Stop(ZDT_ID_TRAY);
+                    cleared = 1u;
+                    break;
+                }
+                if (cleared == 0u) {
+                    continue; /* 4 份（7.2°）仍压着：开关粘死/凸块异常，换一次尝试 */
+                }
+            }
         }
-        if (!Motion_WaitTrayLevel(0u, CFG_TRAY_APPROACH_TIMEOUT_MS)) {
-            (void)Zdt_Stop(ZDT_ID_TRAY);
-            continue;
-        }
-        (void)Zdt_Stop(ZDT_ID_TRAY);
+
+        /* ★ 相位2→3 必须留帧间隙（台架 dbg_app.c:1339 同款 50ms，2026-10-01 补）：
+           反向脱开的停止帧和慢压的速度模式帧背靠背（≈1.5ms）会被驱动器丢掉后者，
+           表现 = "撞开关→弹回来（脱开成功）→托盘再也不动"，1.5s 超时作废重试，
+           每次重试都死在同一处——用户看到的"转一圈→撞→弹回→愣住"循环即此 */
+        vTaskDelay(pdMS_TO_TICKS(50u));
 
         /* 3) 慢速同方向再压：这条沿就是索引零位（与后续定位同方向，背隙已吃进） */
         if (!Zdt_SpeedMode(ZDT_ID_TRAY, (Zdt_DIR_e)CFG_TRAY_DIR_FORWARD, CFG_TRAY_APPROACH_RPM,
@@ -386,8 +404,28 @@ uint8_t Motion_TrayHome(void) {
         (void)Zdt_Stop(ZDT_ID_TRAY);
         vTaskDelay(pdMS_TO_TICKS(50u));
 
-        /* 4) 以此为累计脉冲与索引计数的共同基准 */
-        s_tray_pulses  = 0u;
+        /* 4) 对格偏移（2026-10-01 台架实测）：凸块索引零位与格中心差 CFG_TRAY_HOME_OFFSET_DEG，
+           定零后**正向转过去**才是盒1 正对投放位（同 XY"归零后退 3mm 驻留"的思路）。
+           ★ 脉冲记账的原点仍 = 索引沿：s_tray_pulses 从偏移量起算，索引沿复核
+             （TrayIndexCrossings 按 PER_REV 分界）与盒号折算（TrayBinOf）都保持正确；
+           ★ 附带：驻留位在开关外，不长期压着原点开关（无磨损、无沿计数噪声） */
+        {
+            uint32_t off_pulses =
+                (uint32_t)CFG_TRAY_HOME_OFFSET_DEG * CFG_TRAY_PULSES_PER_REV / 360u;
+
+            if (off_pulses != 0u) {
+                if (!Motion_TrayMovePulses(TRAY_DIR_FWD, off_pulses, CFG_TRAY_APPROACH_RPM)) {
+                    return 0u;
+                }
+                vTaskDelay(
+                    pdMS_TO_TICKS(Kinematics_TrayMoveTimeMs(off_pulses, (float)CFG_TRAY_APPROACH_RPM)));
+                s_tray_pulses = off_pulses; /* 记账原点 = 索引沿，驻留位 = 零位 + 偏移 */
+            } else {
+                s_tray_pulses = 0u;
+            }
+        }
+
+        /* 5) 以此为累计脉冲与索引计数的共同基准 */
         s_bin          = (uint8_t)CFG_TRAY_ZERO_BIN;
         s_tray_trusted = 1u;
         return 1u;

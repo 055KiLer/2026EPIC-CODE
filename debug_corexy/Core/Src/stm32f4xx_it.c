@@ -64,8 +64,8 @@ void SysTick_Handler(void)
   HAL_IncTick();
 }
 
-/* ★ 转盘线（USART1）+ 电机两条线（A=USART3 / B=UART5）+ 控制台（UART4）的接收中断都**自己把标志清干净**，
-   不依赖 HAL 的状态机。
+/* ★ 六路 UART 的接收中断都**自己把标志清干净**，不依赖 HAL 的状态机：
+   转盘=USART1、电机 A=USART3、电机 B=UART5、控制台=UART4、屏=USART6、视觉=USART2。
    血泪教训：这些函数如果留成**空函数**（早期总线只发不收），一旦打开 RXNEIE 就是灾难 ——
    中断里什么都不读，RXNE/ORE 永远置位 → 中断无限重进 → CPU 100% 卡在这里，
    现象是"上电横幅打一半就停住、之后命令一条都不回、只能复位"。
@@ -101,6 +101,22 @@ void UART4_IRQHandler(void)
   uint8_t  byte = (uint8_t)UART4->DR;
 
   Dbg_Uart_IsrPushConsole(byte, sr);
+}
+
+void USART6_IRQHandler(void)
+{
+  uint32_t sr = USART6->SR;
+  uint8_t  byte = (uint8_t)USART6->DR;
+
+  Dbg_Uart_IsrPushScreen(byte, sr); /* 屏线（CN2/USART6） */
+}
+
+void USART2_IRQHandler(void)
+{
+  uint32_t sr = USART2->SR;
+  uint8_t  byte = (uint8_t)USART2->DR;
+
+  Dbg_Uart_IsrPushVision(byte, sr); /* 视觉线（CN3/USART2，ROCK 5C 帧流） */
 }
 
 /* 限位/原点开关的下降沿中断（dbg_config.h §3.5：PB0/PB1/PC5）。

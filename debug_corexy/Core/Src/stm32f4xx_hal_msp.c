@@ -1,10 +1,10 @@
 /**
   ******************************************************************************
   * @file    stm32f4xx_hal_msp.c
-  * @brief   HAL MSP：四路 UART + TIM4 的时钟/引脚/NVIC
-  * @note    引脚与产品工程逐脚一致（2026-09-30 PCB 修复后同步）：
+  * @brief   HAL MSP：六路 UART + TIM4 的时钟/引脚/NVIC
+  * @note    引脚与产品工程逐脚一致（2026-09-30 PCB 修复后同步；2026-10-01 补屏/视觉两路）：
   *          USART1=PB6/PB7(M3 转盘)、USART3=PC10/PC11(M1 电机A)、UART5=PC12/PD2(M2 电机B)、
-  *          UART4=PA0/PA1(CN1 控制台)
+  *          UART4=PA0/PA1(CN1 控制台)、USART6=PC6/PC7(CN2 屏)、USART2=PD5/PD6(CN3 视觉)
   ******************************************************************************
   */
 /* Includes ------------------------------------------------------------------*/
@@ -69,6 +69,24 @@ void HAL_UART_MspInit(UART_HandleTypeDef *uartHandle)
     alt = GPIO_AF8_UART4;
     __HAL_RCC_GPIOA_CLK_ENABLE();
   }
+  else if (uartHandle->Instance == USART6)
+  {
+    /* 串口屏（产品板 CN2 座）。★ F407 上 USART6 是 AF8（USART1/2/3 才是 AF7） */
+    irq = USART6_IRQn;
+    gpio_tx = GPIOC; pin_tx = GPIO_PIN_6;
+    gpio_rx = GPIOC; pin_rx = GPIO_PIN_7;
+    alt = GPIO_AF8_USART6;
+    __HAL_RCC_GPIOC_CLK_ENABLE();
+  }
+  else if (uartHandle->Instance == USART2)
+  {
+    /* 视觉 ROCK 5C（产品板 CN3 座，本侧只收不发） */
+    irq = USART2_IRQn;
+    gpio_tx = GPIOD; pin_tx = GPIO_PIN_5;
+    gpio_rx = GPIOD; pin_rx = GPIO_PIN_6;
+    alt = GPIO_AF7_USART2;
+    __HAL_RCC_GPIOD_CLK_ENABLE();
+  }
   else
   {
     return;
@@ -78,6 +96,8 @@ void HAL_UART_MspInit(UART_HandleTypeDef *uartHandle)
   __HAL_RCC_USART3_CLK_ENABLE();
   __HAL_RCC_UART4_CLK_ENABLE();
   __HAL_RCC_UART5_CLK_ENABLE();
+  __HAL_RCC_USART6_CLK_ENABLE();
+  __HAL_RCC_USART2_CLK_ENABLE();
 
   GPIO_InitStruct.Pin = pin_tx;
   GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;

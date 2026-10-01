@@ -20,6 +20,7 @@
 #include "dbg_gpio.h"
 #include "dbg_print.h"
 #include "dbg_uart.h"
+#include "dbg_vision.h"
 #include "servo_out.h"
 #include "zdt_bus.h"
 /* USER CODE END Includes */
@@ -33,26 +34,30 @@ int main(void)
 
   SystemClock_Config();
 
-  /* 只开用得上的外设：两条电机线 + 控制台 + 舵机定时器；限位/原点开关照产品引脚
-     PB0/PB1/PC5 接进来（dbg_config.h §3.5），用 `lim` 命令看电平与沿计数 */
+  /* 只开用得上的外设：两条电机线 + 转盘 + 控制台 + 屏/视觉 + 舵机定时器；限位/原点开关
+     照产品引脚 PB0/PB1/PC5 接进来（dbg_config.h §3.5），用 `lim` 命令看电平与沿计数 */
   MX_USART1_UART_Init(); /* 转盘 57 线（产品板 M3，广播 0x00） */
   MX_USART3_UART_Init(); /* 电机 A 线（产品板 M1） */
   MX_UART5_Init();       /* 电机 B 线（产品板 M2） */
   MX_UART4_Init();       /* 控制台（产品板 CN1） */
+  MX_USART6_UART_Init(); /* 串口屏（产品板 CN2，`scr`/`scrtest` 命令） */
+  MX_USART2_UART_Init(); /* 视觉（产品板 CN3，`k230` 命令，只收不发） */
   MX_TIM4_Init();        /* 舵机 PWM（PB8/PB9） */
 
   Dbg_Gpio_Init();   /* 限位/原点开关：EXTI 下降沿 + 上拉，与产品 gpio.c 同配置 */
   Dbg_Uart_Init();   /* 控制台接收中断 */
   Dbg_Print_Init();  /* 打印行缓冲 */
-  Servo_Out_Init();  /* 舵机安全位：升降抬升 + 夹爪压 1500us 中位（角度未标定防堵转） */
+  Servo_Out_Init();  /* 舵机安全位：升降到顶（完全升起）+ 夹爪全开（完全展开），值见 dbg_config.h §3 */
 
   Dbg_App_Init();            /* 打配置 + 待核实项 + 上手提示 */
   Dbg_Console_PrintHelp();   /* 打命令表 */
+  Dbg_App_AutoHomeIfEnabled(); /* 上电自动归零（窗口内任意键跳过，见 dbg_config.h §4b） */
 
   while (1)
   {
     /* 全部逻辑都在这里：收命令行 -> 执行。没有 RTOS，也就没有任务/栈/优先级问题 */
     Dbg_Console_Poll();
+    Dbg_Vision_Poll();  /* 视觉线字节 -> 产品解析器副本 -> 缓存（`k230` 命令看结果） */
     Dbg_App_Tick();     /* 没收到过命令就定期重跑总线体检，方便随时打开串口看报告 */
   }
 }

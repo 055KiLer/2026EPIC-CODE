@@ -67,8 +67,8 @@ static uint8_t s_last_xy_trust, s_last_tray_trust;
 static uint32_t s_last_beat_ms;
 
 /* has_qr 保留：K230 帧的 byte[5] 照旧发出，只是产品侧不再使用它。
-   类别 ID 1~6 就是"颜色字节"的值（2026-09-30 起上位机不再拆颜色×形状），形状字节固定 0 */
-static void add_item(float x, float y, uint8_t category, uint8_t has_qr)
+   类别 ID 1~6 = "颜色字节"；形状 1~3 = "形状字节"（2026-10-01 起启用：不参与分类，只选夹持方案） */
+static void add_item(float x, float y, uint8_t category, uint8_t shape, uint8_t has_qr)
 {
     if (s_n_items >= SIM_MAX_ITEMS) {
         printf("sim: 货物数量超上限\n");
@@ -78,22 +78,26 @@ static void add_item(float x, float y, uint8_t category, uint8_t has_qr)
     s_items[s_n_items].item_x_mm = x;
     s_items[s_n_items].item_y_mm = y;
     s_items[s_n_items].category = category;
+    s_items[s_n_items].shape = shape;
     s_items[s_n_items].has_qr = has_qr;
     s_items[s_n_items].grab_radius_mm = 12.0f;
     s_n_items++;
 }
 
 /* 料盘上的 5 列 x 若干行栅格，全部落在工作包络内且互相不重叠。
-   货物用 6 类各若干件（类别 ID 1~6 = 屏上 6 行、盒号表的 6 个下标） */
+   货物用 6 类各若干件（类别 ID 1~6 = 屏上 6 行、盒号表的 6 个下标）+ 形状 0~3 轮着放
+   （0=默认方案、1~3=特调立方体/12面体/六棱柱；形状只选夹持方案、不影响进盒——
+   回归靠"方案-形状匹配"检查覆盖形状路由：传错形状 = 抓取滑脱 = FAIL） */
 static void load_default_lot(int n)
 {
     for (int i = 0; i < n; i++) {
-        float x = 140.0f + 45.0f * (float)(i % 5);
-        float y = 80.0f + 55.0f * (float)(i / 5);
+        float x = -125.0f + 28.0f * (float)(i % 5);
+        float y = -170.0f + 55.0f * (float)(i / 5);
         uint8_t cat = (uint8_t)(i % 6 + 1);              /* 1..6 轮着放 */
+        uint8_t shape = (uint8_t)(i % 4);            /* 0~3 轮着放（0=默认方案 + 三种特调都覆盖到） */
         uint8_t use_qr = (uint8_t)((i % 2) == 0);        /* 帧里照发 hasQR 字节，产品不用 */
 
-        add_item(x, y, cat, use_qr);
+        add_item(x, y, cat, shape, use_qr);
     }
 }
 
@@ -712,19 +716,9 @@ static int v_s17(void)
 }
 
 /* --- S18 按当前出厂配置（投放坐标未回填） --- */
-static void s18_setup(void)
-{
-    load_default_lot(3);
-}
-
-static int v_s18(void)
-{
-    printf("  [观察] 未回填坐标时装置的表现：入盒 %d，抓空 %d，非法落点 %d，"
-           "XY 作废 %d 次（= 每件都作废并反复重标定）\n",
-           g_res.items_done, g_res.items_empty_grab, g_res.items_dropped_outside,
-           g_res.xy_untrust_events);
-    return (g_res.items_done == 0) ? 0 : 1;
-}
+/* s18（出厂配置坐标未回填）已于 2026-10-01 退役：产品 sort_config.h 的几何/标定值
+   已用台架实测值回填，"未回填=拒绝一切绝对定位"的前提不复存在，该场景无法再构造。
+   它验证过的保护（未标定→包络拒绝→不乱走）由代码评审与台架流程覆盖 */
 
 /* --- S19 半截帧回归：屏端静默丢一次发送调用的字节 ---
  * 一轮刷新现在只有 1 条指令（那一行的成功数量）。产品写的是**绝对值**，所以丢一次之后
@@ -778,7 +772,6 @@ static scenario_t s_sc[] = {
     { "s15", "上电凸块正压开关",              120000u, 2,  s15_setup, v_s15 },
     { "s16", "转盘方向标定反了",              600000u, 12, s16_setup, v_s16 },
     { "s17", "每圈 6 个索引沿",               300000u, 0,  s17_setup, v_s17 },
-    { "s18", "出厂配置（坐标未回填）",         120000u, 0,  s18_setup, v_s18 },
     { "s19", "屏指令半截帧（静默丢一次发送）",   120000u, 2,  s19_setup, v_s19 },
 };
 
@@ -847,9 +840,11 @@ int main(int argc, char **argv)
 
     printf("场景 %s：%s（货物 %d 件，几何 %s）\n", sc->name, sc->desc, s_n_items,
            (CFG_DROP_X_MM != 0.0f) ? "已回填" : "未回填(0/0)");
-    printf("  参数: DROP=(%.0f,%.0f) PARK=(%.0f,%.0f) MIN_MM=%.0f\n",
+    printf("  参数: DROP=(%.0f,%.0f) PARK=(%.0f,%.0f) 包络 X[%.0f,%.0f] Y[%.0f,%.0f]\n",
            (double)CFG_DROP_X_MM, (double)CFG_DROP_Y_MM,
-           (double)CFG_PARK_X_MM, (double)CFG_PARK_Y_MM, (double)CFG_WORK_MIN_MM);
+           (double)CFG_PARK_X_MM, (double)CFG_PARK_Y_MM,
+           (double)CFG_WORK_X_MIN_MM, (double)CFG_WORK_X_MAX_MM,
+           (double)CFG_WORK_Y_MIN_MM, (double)CFG_WORK_Y_MAX_MM);
     printf("  视觉: 模型原点=(%.0f,%.0f) 符号 vy->x=%+.0f vx->y=%+.0f | 产品标定 %s\n",
            g_plant.vision_origin_x_mm, g_plant.vision_origin_y_mm,
            (double)g_plant.vision_sign_vy_to_x, (double)g_plant.vision_sign_vx_to_y,
