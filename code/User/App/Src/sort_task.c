@@ -189,6 +189,22 @@ static uint8_t Sort_DoCycle(const K230_Target_t *target) {
         }
         target_x = CFG_WORK_X_MIN_MM;
     }
+    /* ★ +X/+Y 微越界钳位（CFG_WORK_OVERSHOOT_MM，2026-10-02）：软限位 0 给回零开关留了
+       3mm 内收，物块贴外沿映射到 (0,+3] 时机构仍可达，钳回 0 就近夹取；超过 = 标定/
+       镜像问题，作废本件（上位机会持续重报同一目标 → 表现为"机器不动"——先核物块
+       是不是贴边 + 坐标微微越界，别当成新鲜度问题排查）。同样无在途动作，无需 settle */
+    if (target_x > CFG_WORK_X_MAX_MM) {
+        if (target_x > CFG_WORK_X_MAX_MM + CFG_WORK_OVERSHOOT_MM) {
+            return 0u;
+        }
+        target_x = CFG_WORK_X_MAX_MM;
+    }
+    if (target_y > CFG_WORK_Y_MAX_MM) {
+        if (target_y > CFG_WORK_Y_MAX_MM + CFG_WORK_OVERSHOOT_MM) {
+            return 0u;
+        }
+        target_y = CFG_WORK_Y_MAX_MM;
+    }
 
     /* 步骤2+3：转盘预定位（异步）与 XY 移动并行，谁慢等谁 */
     uint32_t tray_est_ms = Motion_TrayGotoBin(bin);
