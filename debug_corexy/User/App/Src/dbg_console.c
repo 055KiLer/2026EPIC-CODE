@@ -1009,6 +1009,20 @@ static uint8_t Dbg_Cmd_K230(char *tok[], uint8_t n) {
             }
             return Dbg_Vision_Live(secs);
         }
+        if (Dbg_Cmd_StrEq(tok[1], "raw") != 0u) {
+            uint32_t secs = 10u;
+
+            if (n >= 3u) {
+                int32_t v = 0;
+
+                if ((Dbg_Cmd_ParseI32(tok[2], &v) == 0u) || (v < 1u) || (v > 120u)) {
+                    Dbg_Printf("[FAIL] 用法：k230 raw [秒]（1~120，缺省 10）\n");
+                    return 0u;
+                }
+                secs = (uint32_t)v;
+            }
+            return Dbg_Vision_Raw(secs);
+        }
         if (Dbg_Cmd_StrEq(tok[1], "sim") != 0u) {
             uint8_t  ok    = 0u;
             uint16_t cat   = 0u;
@@ -1033,7 +1047,7 @@ static uint8_t Dbg_Cmd_K230(char *tok[], uint8_t n) {
             Dbg_Vision_SimFeed((uint8_t)cat, (uint8_t)shape, (float)x, (float)y);
             return 1u;
         }
-        Dbg_Printf("[FAIL] 用法：k230 / k230 clr / k230 live [秒] / k230 sim <类别> <x> <y> [形状]\n");
+        Dbg_Printf("[FAIL] 用法：k230 / k230 clr / k230 live [秒] / k230 raw [秒] / k230 sim <类别> <x> <y> [形状]\n");
         return 0u;
     }
     Dbg_Vision_Print();
@@ -1182,9 +1196,9 @@ static const Dbg_Cmd_t s_cmd[] = {
     {"tspu", "[1|10]", "★转盘速度系数（与 spu 独立）；同时缩放转盘所有等待超时", Dbg_Cmd_Tspu},
     {"tspd", "<20~400>", "★转盘节拍百分比（默认 400 = 产品当前标定 480/240/120rpm；丢步就回 200）", Dbg_Cmd_Tspd},
     {"fmt", "<13|16>", "★位置帧格式：16=V2说明书(0.1°/0.1RPM) 13=老协议(脉冲/RPM)", Dbg_Cmd_Fmt},
-    {"lim", "[clr]", "★限位/原点开关：电平 + 按压计数（消抖+闩锁，只认压下；clr 清零）", Dbg_Cmd_Lim},
-    {"k230", "[clr|live [s]|sim 类 x y [形状]]", "★视觉链路(USART2)：快照+换算 / 清缓存 / 实时流(任意键停) / 本地注帧(形状0~3缺省0)", Dbg_Cmd_K230},
-    {"read", "[等待s]", "★到读帧位再取目标：goto投放点+静默+清缓存+等新鲜帧，给出 pick 坐标（抓取依据必须出自它）", Dbg_Cmd_Read},
+    {"lim", "[clr]", "★限位/原点开关：电平 + 按压计数（消抖+闩锁，只认压下；clr 清零）。撞限位判据=电平连续压住≥10ms（真撞才急停+作废）；毛刺见运动中 [INFO] 行", Dbg_Cmd_Lim},
+    {"k230", "[clr|live [s]|raw [s]|sim 类 x y [形状]]", "★视觉链路(USART2)：快照+换算 / 清缓存 / 实时流(任意键停) / ★raw=线上真相(逐帧 hex+解码+校验判决) / 本地注帧(形状0~3缺省0)", Dbg_Cmd_K230},
+    {"read", "[等待s]", "★到读帧位再取目标：goto投放点+静默+清缓存+等新鲜帧，给出 pick 坐标（抓取依据必须出自它；超时判词分诊：流里没有可用目标帧——报0x00无目标/帧越界/帧没到，并给出\"最后一次报它多久前\"；1008c 起成功行还预演产品钳位=给钳位后落点+可照抄的 pick）", Dbg_Cmd_Read},
     {"scr", "<控件名> <数值>", "★屏(USART6)：发 控件名.val=数值+FFFFFF（如 scr n1 5）", Dbg_Cmd_ScrVal},
     {"scrp", "<控件名> <图片号>", "★屏：发 控件名.pic=图片号（整图切换）", Dbg_Cmd_ScrPic},
     {"scrt", "<控件名> <文本...>", "★屏：发 控件名.txt=\"文本\"", Dbg_Cmd_ScrText},

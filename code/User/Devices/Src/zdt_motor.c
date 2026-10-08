@@ -74,7 +74,7 @@ uint8_t Zdt_MoveRelative(Zdt_ID_e id, Zdt_DIR_e dir, uint16_t speed_rpm, uint8_t
     frame[7]  = (uint8_t)(pulse >> 16);
     frame[8]  = (uint8_t)(pulse >> 8);
     frame[9]  = (uint8_t)(pulse);
-    frame[10] = 0x00u; /* 运动模式：00 = 相对上一目标位置 */
+    frame[10] = (uint8_t)CFG_ZDT_POS_MODE; /* 运动模式：00 = 相对上一目标位置、02 = 相对当前位置（见 sort_config.h 该常量一节） */
     frame[11] = 0x00u; /* 多机同步 = 立即执行 */
     frame[12] = ZDT_CHECKSUM;
 

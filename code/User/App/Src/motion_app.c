@@ -1,7 +1,8 @@
 /**
  * @file    motion_app.c
  * @brief   运动执行器：解算 -> 下发 -> 等待 + 记账可信度
- * @note    1) 守护任务：唯一处置 EXTI 事件的地方（急停 + 作废记账）
+ * @note    1) 守护任务：唯一处置撞限位的地方（急停 + 作废记账；判据 = 电平**连续压住**，
+ *             不是 EXTI 沿闩锁——沿会把电流尖峰耦合出的假"撞限位"当真，见 Motion_ServeEvents）
  *          2) XY：回零标定一次 + 相对脉冲记账；只在"没被急停"时提交记账；
  *             绝对定位先过 Kinematics_XyInEnvelope
  *          3) 转盘：单向趋近消背隙；原点开关回零时是停止条件、定位时是每圈一次的索引沿
@@ -23,11 +24,15 @@ static volatile uint8_t s_xy_trusted = 0u;
 static uint8_t  s_bin              = 0u;
 static uint8_t  s_tray_trusted     = 0u; /* 仅分拣任务读写，无需 volatile */
 static uint8_t  s_tray_moving      = 0u;
-static uint32_t s_tray_pulses      = 0u; /* 自回零起累计已发脉冲（单向只增） */
-static uint32_t s_tray_pulses_mark = 0u;
+static int32_t  s_tray_pulses      = 0;  /* 自回零起累计已发脉冲（**有符号**：双向走时可为负） */
+static int32_t  s_tray_pulses_mark = 0;
 static uint32_t s_tray_index_mark  = 0u;
 static uint32_t s_tray_start_tick  = 0u;
 static uint8_t  s_tray_pending_bin = 0u;
+/* ★ 撞限位判定状态（2026-10-08 起判据 = 电平连续压住，见 Motion_ServeEvents）：
+   s_lim_low_since = 电平"连续压住"的起点（0 = 此刻没压着）；s_lim_fired = 本次压住已处置过 */
+static volatile uint32_t s_lim_low_since = 0u;
+static volatile uint8_t  s_lim_fired     = 0u;
 
 static volatile uint8_t s_stop_xy_pending = 0u;
 static volatile uint8_t s_homing_xy       = 0u; /* 1 = 回零中：压限位是预期动作 */
@@ -112,18 +117,48 @@ static uint8_t Motion_WaitLevel(uint8_t axis, uint8_t want_active, uint32_t time
     return 0u;
 }
 
-/* 限位 -> 急停 + 作废记账；转盘索引沿 -> 只计数，不处置成停机 */
+/* 撞限位处置：真撞 -> 急停 + 作废记账（两者必须同一次做，见下）；转盘索引沿 -> 只计数
+   ★ 2026-10-08 判据换成"电平连续压住"（第二次定案，前一版"沿闩锁 + 停后确认"有硬伤）：
+   现场现象一"抓完之后有时自己回零校准"：EXTI 只要"武装状态下的一次下降沿"就锁存，
+   舵机/电机换向的电流尖峰耦合进限位线同样能造出一次假"撞限位"；旧代码据此立即
+   急停 + 作废记账 ⇒ 分拣任务下一圈重新回零（现场看到的就是那次白跑的回零校准）。
+   现场现象二（前一版引入的硬伤，用户报"一上来连夹持点都到不了"）：把"停止帧照旧立即发、
+   记账晚 40ms 再作废"分开做——毛刺判定为假之后记账被**保留**，可运动其实已被停帧截在半路
+   ⇒ 记账声称"已到位"、实物停在半路 ⇒ 坐标系静默平移（每来一次毛刺漂一次，越抓越歪、
+   最后朝开关顶），比"白跑一次回零"严重得多。
+   ⇒ 判据改成物理事实：**真撞限位时开关一直被龙门压住（几百 ms 起），电气毛刺 µs~ms 级
+      一晃就回**。于是：X 或 Y 电平**连续压住 ≥ CFG_LIMIT_CONFIRM_MS**（1ms 任务周期采样）
+      才认真撞 ⇒ 急停 + 作废记账**一起**发生（停过的运动位置未知，只停不作废必然漂坐标）；
+      窗内电平已松开 = 毛刺 ⇒ **不停、不作废**，本件照常走完（那串假回零就此消失）。
+   代价只有过冲：真撞的停止帧比"边沿即停"晚这个窗发出（200mm/s 下 ≈2mm，见配置注释） */
 static void Motion_ServeEvents(void) {
-    uint32_t events = Bsp_Gpio_TakeEvents();
+    uint32_t now = HAL_GetTick();
 
-    /* 回零期间压限位是正常动作，事件直接丢弃，否则粗压阶段就被停掉、永远收不到触发沿 */
+    /* 沿闩锁不再作判据（判据见上），清掉即可；保留 EXTI 闩锁本身只为"按压发生过"这条
+       诊断语义（与台架 dbg 的 lim 计数同源） */
+    (void)Bsp_Gpio_TakeEvents();
+
+    uint8_t pressed = ((Bsp_Gpio_LimitX() != 0u) || (Bsp_Gpio_LimitY() != 0u)) ? 1u : 0u;
+
+    /* 回零期间压限位是预期动作，收尾的退离相也还压着（见 Motion_HomeXY 的掩护段）：
+       不判定、也不留状态，否则"刚归零完就被判真撞" */
     if (s_homing_xy != 0u) {
+        s_lim_low_since = 0u;
+        s_lim_fired     = 0u;
         return;
     }
 
-    if ((events & BSP_GPIO_EVT_XY_LIMIT) != 0u) {
-        s_xy_trusted      = 0u;
-        s_stop_xy_pending = 1u;
+    if (pressed == 0u) {
+        s_lim_low_since = 0u; /* 松开：清连续计时，并允许下一次判定 */
+        s_lim_fired     = 0u;
+    } else if (s_lim_fired == 0u) {
+        if (s_lim_low_since == 0u) {
+            s_lim_low_since = now;
+        } else if ((now - s_lim_low_since) >= CFG_LIMIT_CONFIRM_MS) {
+            s_lim_fired       = 1u;
+            s_xy_trusted      = 0u; /* 记账作废 */
+            s_stop_xy_pending = 1u; /* 急停（与作废同一次处置，见函数头） */
+        }
     }
 
     if (s_stop_xy_pending != 0u && Motion_StopXY()) {
@@ -147,11 +182,13 @@ void Motion_Init(void) {
     s_y               = 0.0f;
     s_xy_trusted      = 0u;
     s_bin             = (uint8_t)CFG_TRAY_ZERO_BIN;
-    s_tray_pulses     = 0u;
+    s_tray_pulses     = 0;
     s_tray_trusted    = 0u;
     s_tray_moving     = 0u;
-    s_stop_xy_pending = 0u;
-    s_homing_xy       = 0u;
+    s_stop_xy_pending  = 0u;
+    s_homing_xy        = 0u;
+    s_lim_low_since    = 0u;
+    s_lim_fired        = 0u;
     (void)Bsp_Gpio_TakeEvents();
 }
 
@@ -250,15 +287,10 @@ static uint8_t Motion_HomeAxis(uint8_t axis) {
 
 uint8_t Motion_HomeXY(void) {
     s_xy_trusted = 0u;
-    s_homing_xy  = 1u; /* 独占两轴 */
+    s_homing_xy  = 1u; /* 独占两轴（含收尾退离相，见下） */
 
     uint8_t ok_x = Motion_HomeAxis(0u);
     uint8_t ok_y = Motion_HomeAxis(1u);
-
-    /* 顺序不能变：先清 homing 自己压限位留下的事件、再解除让位、最后提交坐标与可信标志，
-       否则守护任务会把这次正常触发当成异常撞限位 */
-    (void)Bsp_Gpio_TakeEvents();
-    s_homing_xy = 0u;
 
     /* ★ 触发点在工作坐标系里 = (CFG_HOME_X_MAX_MM, CFG_HOME_Y_MAX_MM)（开关装在最大
        行程端，09-28 台架实锤；此前误置 0,0 会把整个工作区映射到限位之外） */
@@ -266,12 +298,21 @@ uint8_t Motion_HomeXY(void) {
     s_y          = CFG_HOME_Y_MAX_MM;
     s_xy_trusted = (ok_x && ok_y) ? 1u : 0u;
 
-    if (!s_xy_trusted) {
-        return 0u;
+    /* ★ 退离动作必须在"回零掩护"里做完（s_homing_xy 仍 = 1）：慢压定零结束时两轴都还
+       压在开关上，要等退离开关复位行程走完电平才回高——这段（几十 ms）里"电平压住"是
+       正常状态，一旦让守护任务的撞限位判定跑起来就会判真撞 + 记账当场作废，回零永远接不上
+       （判据换成"电平连续压住"之后这条尤其关键）。退离走完 = 两轴都在开关外（3mm 足够，
+       归零自己就验证过）。顺序不可换：先提交坐标与可信标志 →（掩护中）退离 → 清沿 + 解除掩护 */
+    uint8_t ok_park = 0u;
+
+    if (s_xy_trusted) {
+        ok_park = Motion_MoveXYBlocking(CFG_PARK_X_MM, CFG_PARK_Y_MM, CFG_HOME_SPEED_MM_S);
     }
 
-    /* 停在触发点上等于一直保持触发，之后任何抖动都会被当成撞限位 */
-    if (!Motion_MoveXYBlocking(CFG_PARK_X_MM, CFG_PARK_Y_MM, CFG_HOME_SPEED_MM_S)) {
+    (void)Bsp_Gpio_TakeEvents(); /* 回零自己压出的沿（含退离时松开那一下）到此作废 */
+    s_homing_xy = 0u;
+
+    if ((!s_xy_trusted) || (ok_park == 0u)) {
         s_xy_trusted = 0u; /* 连退到待机点都没成 = 位置未知 */
         return 0u;
     }
@@ -419,7 +460,7 @@ uint8_t Motion_TrayHome(void) {
                 }
                 vTaskDelay(
                     pdMS_TO_TICKS(Kinematics_TrayMoveTimeMs(off_pulses, (float)CFG_TRAY_APPROACH_RPM)));
-                s_tray_pulses = off_pulses; /* 记账原点 = 索引沿，驻留位 = 零位 + 偏移 */
+                s_tray_pulses = (int32_t)off_pulses; /* 记账原点 = 索引沿，驻留位 = 零位 + 偏移 */
             } else {
                 s_tray_pulses = 0u;
             }
@@ -448,27 +489,39 @@ uint32_t Motion_TrayGotoBin(uint8_t bin) {
         return 0u;
     }
 
-    /* 单方向接近消背隙（跨零位自然多转一圈）。
-       前提标定：CFG_TRAY_DIR_FORWARD 必须使"正转 -> 盒号递增"，反了会整圈镜像放错 */
-    uint8_t steps = (uint8_t)((bin + CFG_TRAY_BINS - s_bin) % CFG_TRAY_BINS);
+    /* 盒号差 -> 最短路径（2026-10-08 起默认允许反向，见 CFG_TRAY_ALLOW_REVERSE）：
+       delta 先算"正转要几格"（0..5），超过半圈就折成负值（反向最近）——6 格时 |delta| ≤ 3，
+       恰好 3 格（180°）的平局仍走正转，与老口径一致。
+       前提标定不变：CFG_TRAY_DIR_FORWARD 必须使"正转 -> 盒号递增"，反了会整圈镜像放错 */
+    int32_t delta = (int32_t)((bin + CFG_TRAY_BINS - s_bin) % CFG_TRAY_BINS);
 
-    if (steps == 0u) {
+    if (delta > (int32_t)(CFG_TRAY_BINS / 2)) {
+        delta -= (int32_t)CFG_TRAY_BINS;
+    }
+#if CFG_TRAY_ALLOW_REVERSE == 0u
+    if (delta < 0) {
+        delta += (int32_t)CFG_TRAY_BINS; /* 老口径：单向正转消背隙（跨零位自然多转一圈） */
+    }
+#endif
+
+    if (delta == 0) {
         s_tray_moving = 0u;
         return 0u; /* 已对位 */
     }
 
-    uint32_t pulses = (uint32_t)steps * CFG_TRAY_PULSES_PER_BIN;
+    uint32_t pulses = (uint32_t)((delta > 0) ? delta : -delta) * CFG_TRAY_PULSES_PER_BIN;
+    Zdt_DIR_e dir   = (delta > 0) ? TRAY_DIR_FWD : TRAY_DIR_BACK;
 
     s_tray_pulses_mark = s_tray_pulses;
     s_tray_index_mark  = Bsp_Gpio_TrayIndexCount();
     s_tray_start_tick  = HAL_GetTick();
 
-    if (!Motion_TrayMovePulses(TRAY_DIR_FWD, pulses, CFG_TRAY_SPEED_RPM)) {
+    if (!Motion_TrayMovePulses(dir, pulses, CFG_TRAY_SPEED_RPM)) {
         s_tray_trusted = 0u; /* 指令没发出去 = 转盘根本不会动 */
         return 0u;
     }
 
-    s_tray_pulses += pulses;
+    s_tray_pulses += (delta > 0) ? (int32_t)pulses : -(int32_t)pulses;
     s_tray_pending_bin = bin;
     s_tray_moving      = 1u;
 
@@ -487,11 +540,12 @@ uint8_t Motion_TrayFinish(uint32_t est_ms) {
         vTaskDelay(pdMS_TO_TICKS(est_ms - elapsed_ms));
     }
 
-    /* 索引复核：本笔理论整圈数必须与实测上升沿数完全一致，对不上 = 减速箱丢步/堵转。
+    /* 索引复核：本笔理论"经过几个凸块"必须与实测按压数完全一致，对不上 = 减速箱丢步/堵转。
+       双向都成立（反向经过的凸块同样压一次开关，见 Kinematics_TrayCrossingsBetween）。
        检出能力上界（仿真实测）：一圈只有一个沿，只有把累计脉冲推过/推离整圈边界的那一笔
        才看得见，故上界是一段约一圈的【行程】；漏检窗口内落点偏差理论上界为半圈 = 3 格。
        本模块是滑移【探测器】不是【补偿器】：检出的靠作废重回零，检不出的靠定期重新回零兜底 */
-    uint32_t expect = Kinematics_TrayIndexCrossings(s_tray_pulses_mark, s_tray_pulses);
+    uint32_t expect = Kinematics_TrayCrossingsBetween(s_tray_pulses_mark, s_tray_pulses);
     uint32_t actual = Bsp_Gpio_TrayIndexCount() - s_tray_index_mark;
 
     if (expect != actual) {

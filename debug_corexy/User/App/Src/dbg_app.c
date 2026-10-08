@@ -48,11 +48,20 @@ static uint16_t s_tray_speed_pct = DBG_CFG_TRAY_SPEED_PCT_DEFAULT;
 static float   s_pos_x, s_pos_y;
 static uint8_t s_x_homed, s_y_homed; /* 两轴各自归过零；都归完 = 记账可信 */
 
+/* ★ 撞限位判定状态（2026-10-08 起判据 = 电平连续压住，见 Dbg_App_LimitWatch）：
+   s_lim_low_since = "连续压住"的起点（0 = 此刻没压着）；s_lim_fired = 本次压住已处置过；
+   s_lim_glitch_cnt = 电气毛刺累计（压了不到确认窗就松开 = 不停、不作废，只留证据） */
+static uint32_t s_lim_low_since;
+static uint8_t  s_lim_fired;
+static uint32_t s_lim_glitch_cnt;
+
+static void Dbg_App_LimitWatch(void); /* 前向声明：WaitMsStop（下面）也要每圈调 */
+
 /* ★ 转盘记账（`thome`/`tb` 用，2026-09-30 新增，对齐产品 Motion_TrayHome/GotoBin 的账）：
    s_tray_pulses = 累计电机轴脉冲（回零清零，之后只按成功命令累加）；
    s_bin = 当前对准投放点的盒号；s_tray_trusted = 记账可信（软急停/复核失败都作废）。
    转格后的两条产品同款复核：索引沿计数（检出减速箱丢步/堵转）+ 累计脉冲折算盒号 */
-static uint32_t s_tray_pulses;
+static int32_t  s_tray_pulses; /* 有符号：双向走时为负（与产品同口径） */
 static uint8_t  s_tray_bin;
 static uint8_t  s_tray_trusted;
 
@@ -278,6 +287,7 @@ static uint8_t Dbg_App_WaitMsStop(uint32_t ms) {
     uint32_t t0 = HAL_GetTick();
 
     while ((HAL_GetTick() - t0) < ms) {
+        Dbg_App_LimitWatch(); /* 等运动的这段时间也是"守护任务"：撞限位判据要盯着电平 */
         if (Dbg_Uart_Available() > 0u) {
             return 1u;
         }
@@ -493,6 +503,7 @@ void Dbg_App_Tick(void) {
     /* 示波器观测变量每圈刷新（dbg_app.h）：Keil Watch / Logic Analyzer 直接按名字看，
        g_scope_tick 一直爬 = 固件活着（放最前，不受下面 autoscan 提前返回影响） */
     Dbg_Gpio_Poll(); /* 先维护"松开确认"，让下面的沿计数保持"按压次数"语义 */
+    Dbg_App_LimitWatch(); /* 撞限位判据（电平连续压住）——纯忙等时段靠这里兜住 */
     g_scope_tick++;
     g_claw_us = Servo_Out_CurrentUs(DBG_SERVO_CLAW);
     g_lift_us = Servo_Out_CurrentUs(DBG_SERVO_LIFT);
@@ -732,6 +743,63 @@ uint32_t Dbg_App_LastStopDoneTick(void) {
     return s_stop_done_tick;
 }
 
+/* ★ 撞限位判定（2026-10-08）：判据 = X/Y 电平**连续压住** ≥ DBG_CFG_LIMIT_CONFIRM_MS
+   ——与产品 Motion_ServeEvents **同值同口径**，台架要能预演产品行为。缘由（现场两个现象）：
+   ①"抓完之后有时自己回零校准"：EXTI 只认"武装状态下的一次下降沿"，舵机/电机换向的电流
+     尖峰耦合进限位线就能造出假沿；旧口径"沿闩锁即作废"每来一次毛刺就白跑一次回零。
+   ②"一上来连夹持点都到不了"（拆分口径的硬伤）：停止帧立即发、记账晚 40ms 才作废——
+     毛刺被判成假之后记账被**保留**，可运动其实已被停帧截在半路 ⇒ 记账说"已到位"、
+     实物停在半路 ⇒ 坐标静默平移（仿真 s23 实测：12 件里 41 次抓空、1 次非法落点）。
+   真撞是机械事实：开关**一直被压住**（几百 ms 起，直到人挪开/重新归零）；电气毛刺 µs~ms
+   级一晃就回。⇒ 连续压住 ≥ 窗 ⇒ "真撞"：急停 + 记账作废（**必须一起做**：停过的运动
+   位置未知，只停不作废必然漂坐标）；窗内已松开 ⇒ "毛刺"：不停、不作废，只打一行 [INFO]。
+   调用点：所有可打断等待（WaitMsStop，运动/舵机等待期间每圈）+ 主循环 Dbg_App_Tick
+   （覆盖纯忙等时段），与产品"1ms 守护任务全程盯着"等价。
+   只在记账可信时判定：没记账就没有"作废"可言，也免得一上电龙门正趴在开关上时刷屏 */
+static void Dbg_App_LimitWatch(void) {
+    uint32_t now     = HAL_GetTick();
+    uint8_t  pressed = ((Dbg_Gpio_Level(DBG_LIMIT_X) == 0u) || (Dbg_Gpio_Level(DBG_LIMIT_Y) == 0u))
+                           ? 1u
+                           : 0u;
+
+    if (Dbg_App_XyTrusted() == 0u) {
+        s_lim_low_since = 0u;
+        s_lim_fired     = 0u;
+        return;
+    }
+
+    if (pressed == 0u) {
+        if ((s_lim_fired == 0u) && (s_lim_low_since != 0u)) {
+            /* 压了一下又松开、没到确认窗 = 电气毛刺：这就是现场"抓完自己回零"的源头，
+               产品同口径会忽略它。打印实测时长，便于判断真有毛刺时该不该动确认窗 */
+            s_lim_glitch_cnt++;
+            Dbg_Printf("[INFO] 限位毛刺：只压住 %ums 就松开（< %ums 确认窗）——**不停、不作废**"
+                       "（产品同口径，本件照常走完）；累计第 %u 次\n",
+                       (unsigned)(now - s_lim_low_since), (unsigned)DBG_CFG_LIMIT_CONFIRM_MS,
+                       (unsigned)s_lim_glitch_cnt);
+        }
+        s_lim_low_since = 0u;
+        s_lim_fired     = 0u;
+    } else if (s_lim_fired == 0u) {
+        if (s_lim_low_since == 0u) {
+            s_lim_low_since = now;
+        } else if ((now - s_lim_low_since) >= DBG_CFG_LIMIT_CONFIRM_MS) {
+            uint8_t x_p = (Dbg_Gpio_Level(DBG_LIMIT_X) == 0u) ? 1u : 0u;
+            uint8_t y_p = (Dbg_Gpio_Level(DBG_LIMIT_Y) == 0u) ? 1u : 0u;
+
+            s_lim_fired = 1u;
+            Dbg_App_StopXYFast(); /* 产品同款：急停 */
+            s_x_homed   = 0u;     /* 产品同款：记账作废（两者必须一起，见函数头） */
+            s_y_homed   = 0u;
+            Dbg_Printf("[WARN] 撞限位（%s%s 被连续压住 ≥%ums）= 真撞：已急停 + **XY 记账作废**"
+                       "（停过的运动位置未知）——先看清是不是真压上了开关（`lim` 看电平/计数），"
+                       "再 `homex`/`homey`\n",
+                       (x_p != 0u) ? "X " : "", (y_p != 0u) ? "Y " : "",
+                       (unsigned)DBG_CFG_LIMIT_CONFIRM_MS);
+        }
+    }
+}
+
 /* ★ 停止帧台架实测：广播走 10mm@3mm/s，600ms 后（电机正在走）发停止序列。
    每帧应答判决现场打印——电机停没停 + 哪帧什么应答，一次实验定案：
    02 且停了 = 停止帧好使（此前失败=背靠背丢帧/堵转保护）；
@@ -935,8 +1003,6 @@ static uint8_t Dbg_App_SendXY(float dx, float dy, uint16_t speed_mm_s, uint32_t 
 static uint8_t Dbg_App_ApplyXY(float dx, float dy, uint16_t speed_mm_s) {
     uint32_t est_ms = 0u;
     uint32_t t0;
-    uint32_t ex0 = Dbg_Gpio_EdgeCount(DBG_LIMIT_X);
-    uint32_t ey0 = Dbg_Gpio_EdgeCount(DBG_LIMIT_Y);
 
     if (Dbg_App_SendXY(dx, dy, speed_mm_s, &est_ms) == 0u) {
         return 0u;
@@ -955,14 +1021,13 @@ static uint8_t Dbg_App_ApplyXY(float dx, float dy, uint16_t speed_mm_s) {
         s_last_actual_ms = HAL_GetTick() - t0;
     }
 
+    /* ★ 撞限位的作废不再在这里做（2026-10-08）：判据 = 电平**连续压住**，由
+       Dbg_App_LimitWatch 在等待期间（含本函数上面那段 WaitMsStop）处置，与产品同口径。
+       旧写法是"运动前后比沿计数，只要多一次按压就作废"——把电气毛刺也当成撞限位，
+       现场表现 = 刚归零完就被判"记账不可信"，`p`/`pick`/`read` 全拒（用户报
+       "一上来连夹持点都到不了"）。真撞由上面那个 watch 负责停 + 作废，毛刺则忽略 */
     s_pos_x += dx;
     s_pos_y += dy;
-    if ((Dbg_Gpio_EdgeCount(DBG_LIMIT_X) != ex0) ||
-        (Dbg_Gpio_EdgeCount(DBG_LIMIT_Y) != ey0)) {
-        s_x_homed = 0u;
-        s_y_homed = 0u;
-        Dbg_Printf("[WARN] 运动中限位触发——位置记账作废，重新 homex/homey 后才能用 `p`\n");
-    }
 
     Dbg_Printf("[OK] 走完 实测 %u ms / 估算 %u ms\n", (unsigned)s_last_actual_ms,
                (unsigned)est_ms);
@@ -1420,9 +1485,9 @@ uint8_t Dbg_App_TrayHome(uint16_t seek_rpm) {
                     Dbg_Printf("[WARN] 软急停（相位4）——偏移没走完，重新 thome\n");
                     return 0u;
                 }
-                s_tray_pulses = off_pulses; /* 记账原点 = 索引沿，驻留位 = 零位 + 偏移 */
+                s_tray_pulses = (int32_t)off_pulses; /* 记账原点 = 索引沿，驻留位 = 零位 + 偏移 */
             } else {
-                s_tray_pulses = 0u;
+                s_tray_pulses = 0;
             }
         }
 
@@ -1482,9 +1547,9 @@ uint8_t Dbg_App_TrayGotoBin(uint8_t bin) {
     uint32_t pulses;
     uint32_t est_ms;
     uint32_t t0;
-    uint32_t pulses_mark;
+    int32_t  pulses_mark;
     uint32_t index_mark;
-    uint8_t  steps;
+    int32_t  delta;
 
     if (s_tray_trusted == 0u) {
         Dbg_Printf("[FAIL] 转盘记账不可信——先 `thome` 回零\n");
@@ -1496,22 +1561,34 @@ uint8_t Dbg_App_TrayGotoBin(uint8_t bin) {
         return 0u;
     }
 
-    steps = (uint8_t)((bin + (uint8_t)CFG_TRAY_BINS - s_tray_bin) % (uint8_t)CFG_TRAY_BINS);
-    if (steps == 0u) {
+    /* ★ 2026-10-08 与产品同口径：**双向走最近路径**（6 格时 |delta| ≤ 3，3 格平局仍走正转）。
+       CFG_TRAY_ALLOW_REVERSE = 0 则退回老口径"单向正转消背隙"（最多白转 5 格） */
+    delta = (int32_t)((bin + (uint8_t)CFG_TRAY_BINS - s_tray_bin) % (uint8_t)CFG_TRAY_BINS);
+    if (delta > (int32_t)((uint8_t)CFG_TRAY_BINS / 2u)) {
+        delta -= (int32_t)CFG_TRAY_BINS;
+    }
+#if CFG_TRAY_ALLOW_REVERSE == 0u
+    if (delta < 0) {
+        delta += (int32_t)CFG_TRAY_BINS;
+    }
+#endif
+    if (delta == 0) {
         Dbg_Printf("[OK] 已对准盒 %u\n", (unsigned)(bin + 1u));
         return 1u;
     }
 
-    pulses = (uint32_t)steps * (uint32_t)CFG_TRAY_PULSES_PER_BIN;
+    pulses = (uint32_t)((delta > 0) ? delta : -delta) * (uint32_t)CFG_TRAY_PULSES_PER_BIN;
     est_ms = Kinematics_TrayMoveTimeMs(pulses, (float)CFG_TRAY_SPEED_RPM);
-    Dbg_Printf("[INFO] 转到盒%u：正转 %u 格 = %u 电机脉冲 @%durpm（实际）%u ms 估算（名义口径，等待已按节拍缩放）\n",
-               (unsigned)(bin + 1u), (unsigned)steps, (unsigned)pulses, (unsigned)Dbg_App_TrayRpm(CFG_TRAY_SPEED_RPM),
-               (unsigned)est_ms);
+    Dbg_Printf("[INFO] 转到盒%u：%s %d 格 = %u 电机脉冲 @%durpm（实际）%u ms 估算"
+               "（名义口径，等待已按节拍缩放）\n",
+               (unsigned)(bin + 1u), (delta > 0) ? "正转" : "反转", (int)delta, (unsigned)pulses,
+               (unsigned)Dbg_App_TrayRpm(CFG_TRAY_SPEED_RPM), (unsigned)est_ms);
 
     pulses_mark = s_tray_pulses;
     index_mark  = Dbg_Gpio_EdgeCount(DBG_LIMIT_TRAY);
 
-    if (Dbg_App_TrayMovePulses(DBG_TRAY_DIR_FWD, pulses, (uint16_t)CFG_TRAY_SPEED_RPM) == 0u) {
+    if (Dbg_App_TrayMovePulses((delta > 0) ? DBG_TRAY_DIR_FWD : DBG_TRAY_DIR_BACK, pulses,
+                               (uint16_t)CFG_TRAY_SPEED_RPM) == 0u) {
         s_tray_trusted = 0u; /* 指令没发出去 = 转盘根本不会动 */
         Dbg_Printf("[FAIL] 位置帧没发出去，转盘记账作废\n");
         return 0u;
@@ -1525,11 +1602,11 @@ uint8_t Dbg_App_TrayGotoBin(uint8_t bin) {
                    (unsigned)(HAL_GetTick() - t0));
         return 0u;
     }
-    s_tray_pulses += pulses;
+    s_tray_pulses += (delta > 0) ? (int32_t)pulses : -(int32_t)pulses;
 
     /* 复核①：索引沿计数（dbg_gpio 的消抖按压计数，凸块每圈压一次 = 产品索引沿同口径） */
     {
-        uint32_t expect = Kinematics_TrayIndexCrossings(pulses_mark, s_tray_pulses);
+        uint32_t expect = Kinematics_TrayCrossingsBetween(pulses_mark, s_tray_pulses);
         uint32_t actual = Dbg_Gpio_EdgeCount(DBG_LIMIT_TRAY) - index_mark;
 
         if (expect != actual) {
@@ -1588,7 +1665,9 @@ uint8_t Dbg_App_MoveXY(int32_t dx_mm, int32_t dy_mm, uint16_t speed_mm_s) {
             Dbg_Printf(" Y=");
             Dbg_App_PrintF1(ny);
             Dbg_Printf("）——工作区 X ∈ [%d, 0]、Y ∈ [%d, 0]；要越过限位先 `homex`/`homey` "
-                       "重定，或用 `bx`/`j` 原始帧（无记账、无软限位）\n",
+                       "重定，或用 `bx`/`j` 原始帧（无记账、无软限位）。\n"
+                       "       （贴边件的**绝对定位** `p`/`pick` 不在此列：它们走产品同款钳位"
+                       "——延伸带/极限位带内钳到极限位照样夹）\n",
                        (int)DBG_CFG_XY_X_MIN_MM, (int)DBG_CFG_XY_Y_MIN_MM);
             return 0u;
         }
@@ -1638,8 +1717,16 @@ void Dbg_App_PrintPosition(void) {
 }
 
 /* ★ 绝对定位：走到工作区坐标 (x, y)（第三象限，负数）。
-   前提 = 两轴都归过零且中途没停过/没撞过（记账可信）；越界一律拒绝，绝不朝开关打。
-   工作区：X ∈ [-135, 0]、Y ∈ [-187, 0]；投放点 Y = -187（2026-10-01 口径） */
+   前提 = 两轴都归过零且中途没停过/没撞过（记账可信）。工作区：X ∈ [-135, 0]、Y ∈ [-187, 0]；
+   投放点 Y = -187（2026-10-01 口径）。
+   ★ 2026-10-08：越界不再一律拒绝，改成**与产品 Sort_DoCycle 同口径的钳位**（"够得着就去夹"）
+   ——台架必须能预演产品行为。现场实测："`read` 能到投放位、`pick` 报目标越界 = 到不了夹持点"，
+   而产品那边这些目标其实会钳位照夹 ⇒ 台架必须走同一条路。逐条与产品同序（见 dbg_config.h
+   "产品工作包络与够得着就去钳位"一节）：
+     ① X ∈ [-160, -135) ⇒ 钳到 -135（夹爪延伸带）
+     ② X < -160 / Y < -187 ⇒ 拒绝（产品同样整件作废、机器一动不动）
+     ③ X/Y > 上限 且 ≤ 上限+25mm ⇒ 钳到上限照样伸爪（极限位夹取带）；> 25mm ⇒ 拒绝
+     ④ 钳完按保护边距回拉：> 上限-5mm ⇒ 到 上限-5mm（永不朝回零开关顶满） */
 uint8_t Dbg_App_Goto(float x, float y, uint16_t speed_mm_s) {
     float dx;
     float dy;
@@ -1648,13 +1735,73 @@ uint8_t Dbg_App_Goto(float x, float y, uint16_t speed_mm_s) {
         Dbg_Printf("[FAIL] 位置记账不可信——先 `homex` + `homey` 归零\n");
         return 0u;
     }
-    if ((x > DBG_CFG_XY_MAX_MM) || (x < DBG_CFG_XY_X_MIN_MM) ||
-        (y > DBG_CFG_XY_MAX_MM) || (y < DBG_CFG_XY_Y_MIN_MM)) {
-        Dbg_Printf("[FAIL] 目标越界：X 须在 [%d, %d]、Y 须在 [%d, %d] 内"
-                   "（正方向是开关，禁止）\n",
-                   (int)DBG_CFG_XY_X_MIN_MM, (int)DBG_CFG_XY_MAX_MM,
-                   (int)DBG_CFG_XY_Y_MIN_MM, (int)DBG_CFG_XY_MAX_MM);
+
+    /* ①/② -X 侧：延伸带内钳位、带外拒绝 */
+    if (x < DBG_CFG_XY_X_MIN_MM) {
+        if (x < DBG_CFG_PROD_X_CLAMP_MM) {
+            Dbg_Printf("[FAIL] X ");
+            Dbg_App_PrintF1(x);
+            Dbg_Printf(" 超出夹爪延伸带（下限 %d）——夹爪延伸也够不着，拒绝"
+                       "（产品同样整件作废、机器一动不动）\n",
+                       (int)DBG_CFG_PROD_X_CLAMP_MM);
+            return 0u;
+        }
+        Dbg_Printf("[GOTO] X ");
+        Dbg_App_PrintF1(x);
+        Dbg_Printf(" 在夹爪延伸带内——钳到 %d 就近夹取（产品同款）\n", (int)DBG_CFG_XY_X_MIN_MM);
+        x = DBG_CFG_XY_X_MIN_MM;
+    }
+    if (y < DBG_CFG_XY_Y_MIN_MM) {
+        Dbg_Printf("[FAIL] Y ");
+        Dbg_App_PrintF1(y);
+        Dbg_Printf(" 低于工作区下限 %d（-Y 端 = 机械极限，无延伸量——产品同样整件作废）\n",
+                   (int)DBG_CFG_XY_Y_MIN_MM);
         return 0u;
+    }
+
+    /* ③ +侧极限位夹取带：带内钳到上限、带外拒绝 */
+    if (x > DBG_CFG_XY_MAX_MM) {
+        if (x > (DBG_CFG_XY_MAX_MM + DBG_CFG_PROD_CLAMP_BAND_MM)) {
+            Dbg_Printf("[FAIL] X ");
+            Dbg_App_PrintF1(x);
+            Dbg_Printf(" 超出极限位夹取带（上限 %d + 带 %dmm）——产品同样整件作废、机器一动不动\n",
+                       (int)DBG_CFG_XY_MAX_MM, (int)DBG_CFG_PROD_CLAMP_BAND_MM);
+            return 0u;
+        }
+        Dbg_Printf("[GOTO] X ");
+        Dbg_App_PrintF1(x);
+        Dbg_Printf(" 在极限位夹取带内——钳到 %d 照样伸爪（产品同款；可能夹偏/抓空，"
+                   "用户口径\"不管怎么样都直接夹\"）\n",
+                   (int)DBG_CFG_XY_MAX_MM);
+        x = DBG_CFG_XY_MAX_MM;
+    }
+    if (y > DBG_CFG_XY_MAX_MM) {
+        if (y > (DBG_CFG_XY_MAX_MM + DBG_CFG_PROD_CLAMP_BAND_MM)) {
+            Dbg_Printf("[FAIL] Y ");
+            Dbg_App_PrintF1(y);
+            Dbg_Printf(" 超出极限位夹取带（上限 %d + 带 %dmm）——产品同样整件作废、机器一动不动\n",
+                       (int)DBG_CFG_XY_MAX_MM, (int)DBG_CFG_PROD_CLAMP_BAND_MM);
+            return 0u;
+        }
+        Dbg_Printf("[GOTO] Y ");
+        Dbg_App_PrintF1(y);
+        Dbg_Printf(" 在极限位夹取带内——钳到 %d 照样伸爪（产品同款；可能夹偏/抓空）\n",
+                   (int)DBG_CFG_XY_MAX_MM);
+        y = DBG_CFG_XY_MAX_MM;
+    }
+
+    /* ④ 保护边距：贴上限的目标回拉（产品 CFG_WORK_EDGE_MARGIN_MM，见 sort_config.h 该节） */
+    if (x > (DBG_CFG_XY_MAX_MM - DBG_CFG_PROD_WORK_EDGE_MARGIN)) {
+        Dbg_Printf("[GOTO] X 贴上限，按保护边距回拉到 ");
+        Dbg_App_PrintF1(DBG_CFG_XY_MAX_MM - DBG_CFG_PROD_WORK_EDGE_MARGIN);
+        Dbg_Printf("（产品同款：不朝回零开关顶满）\n");
+        x = DBG_CFG_XY_MAX_MM - DBG_CFG_PROD_WORK_EDGE_MARGIN;
+    }
+    if (y > (DBG_CFG_XY_MAX_MM - DBG_CFG_PROD_WORK_EDGE_MARGIN)) {
+        Dbg_Printf("[GOTO] Y 贴上限，按保护边距回拉到 ");
+        Dbg_App_PrintF1(DBG_CFG_XY_MAX_MM - DBG_CFG_PROD_WORK_EDGE_MARGIN);
+        Dbg_Printf("（产品同款：不朝回零开关顶满）\n");
+        y = DBG_CFG_XY_MAX_MM - DBG_CFG_PROD_WORK_EDGE_MARGIN;
     }
 
     dx = x - s_pos_x;
@@ -1915,14 +2062,25 @@ void Dbg_App_MeasureFrame(uint8_t motor, uint8_t addr, uint16_t repeat) {
    → 清一次缓存（丢掉挡相机期间产生的旧帧）→ 等一帧"新鲜"目标。
    ★ 作为抓取依据的坐标必须出自本命令；`k230` 快照随时可看，但不承担读帧纪律。
    目标不消费：同一目标重复 read 会重复给出，拿走货/上位机换目标后自然更新。
-   任意键 = 中止等待（本命令只读不抓，不动爪不停车） */
+   任意键 = 中止等待（本命令只读不抓，不动爪不停车）
+   ★ 2026-10-08 分诊（现场"夹爪不去抓 / 无新鲜帧"）：本命令的"先清缓存、再等新帧"就是产品
+     Sort_PrepareRead 的同款口径。现场口径 = **上位机从上电起持续发流** ⇒ 机器报"没有可用的
+     目标帧"时，只可能是三选一（不预设谁的问题）：①流里是状态 0x00 的帧（上位机在说"本帧无目标"）
+     ②流里有目标帧但类别/形状越界（本机按设计一律丢弃：宁可不抓，绝不放错盒）
+     ③帧没到本机（校验/帧长/波特率/接线）。
+     所以清缓存前先记一笔"本来有没有目标 + 它多久前到的"，超时后按四种指纹给判词；
+     再配 `k230`（链路 + 三类计数）与 `k230 raw`（逐帧 hex/解码/校验判决）一次定死 */
 uint8_t Dbg_App_ReadTarget(uint16_t wait_s) {
+    K230_Target_t before; /* 清缓存前缓存里的目标（可能没有） */
     K230_Target_t t;
     float         mx = 0.0f;
     float         my = 0.0f;
     uint32_t      t0;
     uint32_t      next_report;
     uint32_t      none0;
+    uint32_t      bad0;
+    uint32_t      before_age = 0u;
+    uint8_t       before_had;
     uint8_t       dead_printed = 0u;
 
     if (wait_s == 0u) {
@@ -1945,15 +2103,24 @@ uint8_t Dbg_App_ReadTarget(uint16_t wait_s) {
         Dbg_Printf("[WARN] 静默期被中止\n");
         return 0u;
     }
+
+    /* ★ 清缓存前先记一笔：区分"本来就有目标（流里刚有、现在断了）"与"一直没有目标"（见函数头分诊） */
+    before_had = Dbg_Vision_TargetSnapshot(&before, &before_age);
+
     Dbg_Vision_Flush(); /* 旧帧作废：挡相机期间产生的坐标不能用 */
 
     Dbg_Printf("[READ] 已到读帧位 (%d,%d) + 静默 %ums，缓存已清，等目标 ≤%us（任意键中止）\n",
                (int)DBG_CFG_DROP_X_MM, (int)DBG_CFG_DROP_Y_MM, (unsigned)CFG_VISION_SETTLE_MS,
                (unsigned)wait_s);
+    if (before_had != 0u) {
+        Dbg_Printf("[READ] （清缓存前缓存里有：类别 %u，%ums 前）\n", (unsigned)before.category,
+                   (unsigned)before_age);
+    }
 
     t0          = HAL_GetTick();
     next_report = t0 + 1000u;
     none0       = Dbg_Vision_NoneCount();
+    bad0        = Dbg_Vision_BadCount();
 
     for (;;) {
         if (Dbg_Uart_Available() > 0u) { /* 只排空不执行：中止等待不算软急停 */
@@ -1967,8 +2134,12 @@ uint8_t Dbg_App_ReadTarget(uint16_t wait_s) {
         Dbg_Vision_Poll(); /* 阻塞等待期间必须自己泵视觉线（主循环没在跑） */
 
         if (Dbg_Vision_GetTarget(&t) != 0u) {
+            uint32_t age = 0u;
+
+            (void)Dbg_Vision_TargetSnapshot(&t, &age); /* 同一个缓存条目：取它的"到帧年龄" */
             Dbg_Vision_ToMachine(&t, &mx, &my);
-            Dbg_Printf("[READ] ✓ 目标：类别 %u 形状 %u  视觉(", (unsigned)t.category, (unsigned)t.shape);
+            Dbg_Printf("[READ] ✓ 目标：类别 %u 形状 %u（本帧 %ums 前到）  视觉(", (unsigned)t.category,
+                       (unsigned)t.shape, (unsigned)age);
             Dbg_App_PrintF1(t.x_mm);
             Dbg_Printf(", ");
             Dbg_App_PrintF1(t.y_mm);
@@ -1982,6 +2153,76 @@ uint8_t Dbg_App_ReadTarget(uint16_t wait_s) {
                        (int)((mx >= 0.0f) ? (mx + 0.5f) : (mx - 0.5f)),
                        (int)((my >= 0.0f) ? (my + 0.5f) : (my - 0.5f)), (unsigned)t.shape,
                        (unsigned)t.category);
+
+            /* ★ 2026-10-08：预演**产品**会不会要这个目标（现场"机器不动 / 到不了夹持点"
+               最常见的一条）。判据 = 产品 Sort_DoCycle 的决策树，与 dbg_config.h
+               "产品工作包络与够得着就去钳位"一节逐条同序：-X 延伸带到 -160、+侧极限位夹取带
+               25mm、保护边距 5mm ⇒ 只有**带外**才整件作废。
+               ★ 台架 `p`/`pick` 现在用**同一套钳位**（见 Dbg_App_Goto）⇒ 打印钳位后的实际
+                 落点，并给一条可直接照抄的 `pick`（现场"台架拒绝、产品会夹"对不上的坑） */
+            {
+                float   cx  = mx;
+                float   cy  = my;
+                uint8_t bad = 0u;
+
+                if (cx < DBG_CFG_PROD_X_CLAMP_MM) {
+                    bad = 1u;
+                } else if (cx < DBG_CFG_PROD_WORK_X_MIN) {
+                    cx = DBG_CFG_PROD_WORK_X_MIN;
+                }
+                if (cy < DBG_CFG_PROD_WORK_Y_MIN) {
+                    bad = 1u;
+                }
+                if (cx > (DBG_CFG_PROD_WORK_X_MAX + DBG_CFG_PROD_CLAMP_BAND_MM)) {
+                    bad = 1u;
+                } else if (cx > DBG_CFG_PROD_WORK_X_MAX) {
+                    cx = DBG_CFG_PROD_WORK_X_MAX;
+                }
+                if (cy > (DBG_CFG_PROD_WORK_Y_MAX + DBG_CFG_PROD_CLAMP_BAND_MM)) {
+                    bad = 1u;
+                } else if (cy > DBG_CFG_PROD_WORK_Y_MAX) {
+                    cy = DBG_CFG_PROD_WORK_Y_MAX;
+                }
+                if (cx > (DBG_CFG_PROD_WORK_X_MAX - DBG_CFG_PROD_WORK_EDGE_MARGIN)) {
+                    cx = DBG_CFG_PROD_WORK_X_MAX - DBG_CFG_PROD_WORK_EDGE_MARGIN;
+                }
+                if (cy > (DBG_CFG_PROD_WORK_Y_MAX - DBG_CFG_PROD_WORK_EDGE_MARGIN)) {
+                    cy = DBG_CFG_PROD_WORK_Y_MAX - DBG_CFG_PROD_WORK_EDGE_MARGIN;
+                }
+
+                if (bad != 0u) {
+                    Dbg_Printf("[READ] ⚠️ 该目标**超出产品可达范围**——工作区机械 X∈[%d,%d]、"
+                               "Y∈[%d,%d]；-X 延伸带到 %d、+侧极限位夹取带 %dmm、保护边距 %dmm\n",
+                               (int)DBG_CFG_PROD_WORK_X_MIN, (int)DBG_CFG_PROD_WORK_X_MAX,
+                               (int)DBG_CFG_PROD_WORK_Y_MIN, (int)DBG_CFG_PROD_WORK_Y_MAX,
+                               (int)DBG_CFG_PROD_X_CLAMP_MM, (int)DBG_CFG_PROD_CLAMP_BAND_MM,
+                               (int)DBG_CFG_PROD_WORK_EDGE_MARGIN);
+                    Dbg_Printf("[READ] ⚠️ ⇒ 产品固件会**按设计作废本件、机器一动不动**"
+                               "（不是取帧/新鲜度问题）：先看物块是不是放在够不着的边上/托盘外，\n"
+                               "         再核视觉→机械映射（原点 CFG_VISION_ORIGIN_*／符号 SIGN_*／"
+                               "视觉侧比例）\n");
+                } else {
+                    Dbg_Printf("[READ] 产品/台架都会去抓：钳位后实际落点 (");
+                    Dbg_App_PrintF1(cx);
+                    Dbg_Printf(", ");
+                    Dbg_App_PrintF1(cy);
+                    Dbg_Printf(")");
+                    if ((cx != mx) || (cy != my)) {
+                        Dbg_Printf("（贴边钳位：+侧 ≤%dmm 钳到上限-保护边距 %dmm、"
+                                   "-X ≤%d 钳到 %d）——爪落极限位，可能夹偏/抓空\n",
+                                   (int)DBG_CFG_PROD_CLAMP_BAND_MM,
+                                   (int)DBG_CFG_PROD_WORK_EDGE_MARGIN,
+                                   (int)DBG_CFG_PROD_X_CLAMP_MM, (int)DBG_CFG_PROD_WORK_X_MIN);
+                    } else {
+                        Dbg_Printf("（坐标在区内，不钳位）\n");
+                    }
+                    Dbg_Printf("[READ] 照抄这条即可（台架与产品同口径）："
+                               "`pick %d %d 100 %u`\n",
+                               (int)((cx >= 0.0f) ? (cx + 0.5f) : (cx - 0.5f)),
+                               (int)((cy >= 0.0f) ? (cy + 0.5f) : (cy - 0.5f)),
+                               (unsigned)t.shape);
+                }
+            }
             return 1u;
         }
 
@@ -1992,15 +2233,42 @@ uint8_t Dbg_App_ReadTarget(uint16_t wait_s) {
 
         if ((int32_t)(HAL_GetTick() - next_report) >= 0) {
             next_report += 1000u;
-            Dbg_Printf("[READ] …等待中 无目标+%u 帧 链路=%s\n",
+            Dbg_Printf("[READ] …等待中 无目标+%u 越界+%u 链路=%s\n",
                        (unsigned)(Dbg_Vision_NoneCount() - none0),
+                       (unsigned)(Dbg_Vision_BadCount() - bad0),
                        (Dbg_Vision_LinkAlive() != 0u) ? "活" : "断");
         }
 
         if ((HAL_GetTick() - t0) > ((uint32_t)wait_s * 1000u)) {
-            Dbg_Printf("[FAIL] %us 内没有新鲜目标（无目标 %u 帧）——两种典型：上位机没发；"
-                       "还在发旧\"颜色×形状\"编码（会被当无目标丢掉：宁可不抓，不放错盒）\n",
-                       (unsigned)wait_s, (unsigned)(Dbg_Vision_NoneCount() - none0));
+            uint32_t none = Dbg_Vision_NoneCount() - none0;
+            uint32_t bad  = Dbg_Vision_BadCount() - bad0;
+
+            Dbg_Printf("[FAIL] %us 内没有新鲜目标（无目标 %u 帧 / 越界 %u 帧 / 链路=%s）\n",
+                       (unsigned)wait_s, (unsigned)none, (unsigned)bad,
+                       (Dbg_Vision_LinkAlive() != 0u) ? "活" : "断");
+            if (before_had != 0u) {
+                /* 清缓存前有目标、之后一帧没有：说明"这一小段流里没有可用目标帧"了 ——
+                   不预设是谁的问题，把三种可能一起摆出来，让 k230/k230 raw 去定死 */
+                Dbg_Printf("[FAIL] ★ 清缓存前缓存里{有}目标（类别 %u，%ums 前），清缓存后一帧新的都没有\n"
+                           "         ⇒ 这一小段流里不再有可用目标帧。三种可能（`k230` 三类计数、`k230 raw` 逐帧 hex 定死）：\n"
+                           "         ① 上位机改成在说\"本帧无目标\"（0x00）＝它不再把这一件当目标\n"
+                           "         ② 之后的帧报了目标、但类别/形状越界（本机按设计丢弃）\n"
+                           "         ③ 帧干脆不来了（链路）；*上位机若是\"发固定帧数就停\"的实现，一串播完也落到这里*\n",
+                           (unsigned)before.category, (unsigned)before_age);
+            } else if (none > 0u) {
+                Dbg_Printf("[FAIL] ★ 上位机在发\"本帧无目标\"（0x00）——物块在托盘上却没被当成目标\n"
+                           "       ⇒ 识别/目标挑选问题（典型：被龙门挡过之后没把物块认回来）；\n"
+                           "         `k230 live 20` 盯着看：一帧目标都没有就是它\n");
+            } else if (bad > 0u) {
+                Dbg_Printf("[FAIL] ★ 上位机在报目标，但帧**越界**（类别须 1~%u、形状须 0~%u）\n"
+                           "       ⇒ 两边编码口径不一致（不是没识别到）：查上位机的类别/形状编号\n"
+                           "         （类别 = 屏上行号 = 盒号 1~%u；形状 0~3：0=默认方案）\n",
+                           (unsigned)CFG_NUM_CATEGORIES, (unsigned)CFG_NUM_SHAPES,
+                           (unsigned)CFG_NUM_CATEGORIES);
+            } else {
+                Dbg_Printf("[FAIL] ★ 线上一帧都没有（链路断）——查接线/波特率/上位机进程在不在发；\n"
+                           "         想确认接收侧：`k230 sim 3 60 45` 本地注一帧应能立刻看到\n");
+            }
             return 0u;
         }
     }

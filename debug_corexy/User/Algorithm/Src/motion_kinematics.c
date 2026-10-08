@@ -47,19 +47,49 @@ uint32_t Kinematics_TrayMoveTimeMs(uint32_t pulses, float rpm) {
     return time_ms + CFG_MOVE_EXTRA_MS;
 }
 
-uint32_t Kinematics_TrayIndexCrossings(uint32_t from_pulses, uint32_t to_pulses) {
-    if (to_pulses <= from_pulses) {
-        return 0u;
-    }
+/* 有符号地板除：C 的 / 向零截断，负脉冲（反向走）下会把整圈边界算错 */
+static int32_t Kin_FloorDiv(int32_t a, int32_t b) {
+    int32_t q = a / b;
 
-    return (to_pulses / CFG_TRAY_PULSES_PER_REV) - (from_pulses / CFG_TRAY_PULSES_PER_REV);
+    if (((a % b) != 0) && ((a < 0) != (b < 0))) {
+        q--;
+    }
+    return q;
 }
 
-uint8_t Kinematics_TrayBinOf(uint32_t pulses) {
-    uint32_t in_rev = pulses % CFG_TRAY_PULSES_PER_REV;
-    uint32_t bin    = (in_rev + CFG_TRAY_PULSES_PER_BIN / 2u) / CFG_TRAY_PULSES_PER_BIN;
+/* 向上取整的整数除法（反向走要用它数"进入凸块作用弧"的次数） */
+static int32_t Kin_CeilDiv(int32_t a, int32_t b) {
+    return -Kin_FloorDiv(-a, b);
+}
 
-    return (uint8_t)(bin % CFG_TRAY_BINS);
+/* 两个脉冲记账点之间**经过几个凸块**（= 索引沿的理论次数），双向都成立。
+   口径（与开关的物理行为对齐）：
+     - 记账原点 = 索引沿 ⇒ 凸块只在 k×一圈 的整数倍处（不是"半个标称圈"）
+     - "经过" = **进入凸块作用弧**：正转数 (from, to] 内的整数倍（终点正好压上算一次、
+       起点已经压着不算）；反转对称地数 [to, from) 内的整数倍
+     - 单调正转时与旧实现 (to/REV − from/REV) 逐值相同 ⇒ 举证口径不变，只是多了反向 */
+uint32_t Kinematics_TrayCrossingsBetween(int32_t from_pulses, int32_t to_pulses) {
+    int32_t rev = (int32_t)CFG_TRAY_PULSES_PER_REV;
+
+    if (to_pulses == from_pulses) {
+        return 0u;
+    }
+    if (to_pulses > from_pulses) {
+        return (uint32_t)(Kin_FloorDiv(to_pulses, rev) - Kin_FloorDiv(from_pulses, rev));
+    }
+    return (uint32_t)(Kin_CeilDiv(from_pulses, rev) - Kin_CeilDiv(to_pulses, rev));
+}
+
+/* 累计脉冲（**有符号**：双向走时可以为负）-> 当前对准投放点的盒号 */
+uint8_t Kinematics_TrayBinOf(int32_t pulses) {
+    int32_t rev    = (int32_t)CFG_TRAY_PULSES_PER_REV;
+    int32_t per    = (int32_t)CFG_TRAY_PULSES_PER_BIN;
+    int32_t in_rev = pulses % rev;
+
+    if (in_rev < 0) {
+        in_rev += rev;
+    }
+    return (uint8_t)(((in_rev + per / 2) / per) % (int32_t)CFG_TRAY_BINS);
 }
 
 /* ★ 本副本的包络函数是历史版本（旧 CFG_WORK_MIN_MM/MAX_X/MAX_Y 口径）：台架工程内无人调用——

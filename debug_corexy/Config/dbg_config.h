@@ -81,7 +81,10 @@
    说明书示例用 511；45rpm 约 0.09s 加速完成，台架先用它，跑顺后再标定 */
 #define DBG_CFG_ACC16_RPM_PS 511u
 /* 位置帧的相对/绝对与多机同步字节（产品都是 0：相对、立即执行） */
-#define DBG_CFG_POS_MODE_RELATIVE 0x00u
+/* ★ 位置帧「运动模式」字节：0x00 = 相对上一目标位置（现状）、0x02 = 相对当前位置。
+   2026-10-08：现场"坐标系整体偏 +Y"的根因 = 中断运动留旧目标（见产品 sort_config.h）；
+   0x02 未验通前保持 0x00。台架验法：dump 出帧 → 第 11 字节改 02 → send；或直接改这里重烧 */
+#define DBG_CFG_POS_MODE_RELATIVE 0x00u /* 2026-10-08 台架证伪 0x02（x/y 侧向移动）⇒ 退回 0x00 */
 
 /* 等回包的时长（ms）：驱动器收到正确命令会立刻回 [地址][功能码][02][6B]
    （物创 `code/ZDT_drive.c` 里 `HAL_UART_Receive(..., 4 字节, 2ms)` 就是这么收的）
@@ -137,6 +140,36 @@
 /* ★ 屏/视觉线被噪声预算关掉后的**自动重开间隔**：这两条线要常收（视觉是持续帧流），
    与电机线"发帧前按需再开"不同——线没接/悬空时最多每 2s 付一窗噪声预算，不会风暴 */
 #define DBG_CFG_DEV_LINE_REARM_MS 2000u
+
+/* ★ 产品工作包络与"够得着就去"钳位（2026-10-08，逐值来自产品 code/Config/sort_config.h；
+   本文件是台架真源，镜像 sort_config.h 已陈旧、不能当对表依据）：
+   `read` 用它**预演产品会怎么判**；`p`/`pick` 用**同一套钳位**去走——台架必须与产品同行为，
+   否则现场"台架拒绝、产品会夹"对不上（2026-10-08 用户实测：`read` 能到投放位、
+   `pick` 报目标越界 = 到不了夹持点；产品那边其实是钳位照夹的）。
+   产品判据（= Sort_DoCycle 的决策树，逐条同序）：
+     ① X ∈ [-160, -135)        ⇒ 钳到 -135 就近夹（夹爪延伸带 = DBG_CFG_PROD_X_CLAMP_MM）
+     ② X < -160 / Y < -187     ⇒ 整件作废：机器一动不动（"宁可少抓，不放错盒"）
+     ③ X/Y > 上限(0) 且 ≤ 上限+25mm ⇒ 钳到上限**照样伸爪**（极限位夹取带）
+        超过 25mm               ⇒ 整件作废
+     ④ 钳完再按保护边距回拉：> 上限-5mm 就压到 上限-5mm（永不朝回零开关顶满）
+   贴边件抓不到时：先查物块是不是真放在够不着的边上/托盘外，再核视觉→机械映射
+   （原点 CFG_VISION_ORIGIN_*／符号 SIGN_*／视觉侧比例）——**不是新鲜度问题** */
+#define DBG_CFG_PROD_WORK_X_MIN  (-135.0f)
+#define DBG_CFG_PROD_WORK_X_MAX  (0.0f)
+#define DBG_CFG_PROD_WORK_Y_MIN  (-187.0f)
+#define DBG_CFG_PROD_WORK_Y_MAX  (0.0f)
+#define DBG_CFG_PROD_WORK_OVERSHOOT 3.0f /* 旧口径遗留（现被 ③ 的 25mm 带覆盖），只作参考 */
+#define DBG_CFG_PROD_X_CLAMP_MM      (-160.0f) /* = 产品 CFG_XY_X_CLAMP_MM：-X 夹爪延伸带 */
+#define DBG_CFG_PROD_CLAMP_BAND_MM   25.0f     /* = 产品 CFG_XY_X/Y_CLAMP_BAND_MM：+侧带值 */
+#define DBG_CFG_PROD_WORK_EDGE_MARGIN 5.0f     /* = 产品 CFG_WORK_EDGE_MARGIN_MM：保护边距 */
+
+/* ★ 撞限位判据（2026-10-08，与产品 CFG_LIMIT_CONFIRM_MS **同值同口径**）：X/Y 电平
+   **连续压住**这么久才算真撞（急停 + XY 记账作废）；窗内已松开 = 电气毛刺 ⇒ 不停、不作废。
+   现场两个现象把口径逼到这一条：①"抓完之后有时自己回零校准"（旧"沿闩锁即作废"把舵机/
+   电机电流尖峰耦合出的假沿当真，每来一次就白跑一次回零）②"一上来连夹持点都到不了"
+   （拆分口径：停止帧立即发、记账晚 40ms 才作废 ⇒ 毛刺后记账被保留、可运动已被截在半路
+   ⇒ 记账说"已到位"、实物停在半路 ⇒ 坐标静默平移）。实现见 dbg_app.c 的 Dbg_App_LimitWatch */
+#define DBG_CFG_LIMIT_CONFIRM_MS 10u
 
 /* 逐字符回显收到的字节 —— 排查"发命令没反应"最有用的一件工具：
      1 = 回显：可打印字符原样回显，**不可见字节打成 <0xNN>**
@@ -196,7 +229,10 @@
 #define DBG_CFG_SERVO_MIN_US 400u
 #define DBG_CFG_SERVO_MAX_US 2600u
 /* 切档后等舵机走到位的默认时间 */
-#define DBG_CFG_FW_STAMP "1002b" /* ★固件版本戳：横幅/stat 可见——"板上烧的哪个版本"一眼定，杜绝新旧混淆 */
+#define DBG_CFG_FW_STAMP "1008c" /* ★固件版本戳：横幅/stat 可见——"板上烧的哪个版本"一眼定，杜绝新旧混淆
+                                    （1008a/b = `read` 超时判词分诊 + `k230 raw` 线上真相；
+                                     1008c = 撞限位判据换成"电平连续压住"（毛刺不停、不作废）
+                                       + `p`/`pick` 与产品同口径钳位（延伸带/极限位带/保护边距）） */
 #define DBG_CFG_SERVO_SETTLE_MS 400u
 
 /* ================= 3.5 限位 / 原点微动开关 ================= */

@@ -23,11 +23,11 @@ uint32_t Kinematics_MoveTimeMs(int32_t pulse, float rpm);
 /* 转盘：pulses 为电机轴细分脉冲（已含 1:20）；pulse 与 rpm 口径一致，不得再乘减速比 */
 uint32_t Kinematics_TrayMoveTimeMs(uint32_t pulses, float rpm);
 
-/* 单向从 from 走到 to，理论上跨过几个整圈（= 原点索引沿次数），用于检出丢步 */
-uint32_t Kinematics_TrayIndexCrossings(uint32_t from_pulses, uint32_t to_pulses);
+/* 两个脉冲记账点之间经过几个凸块（= 索引沿理论次数）；双向都成立（有符号脉冲） */
+uint32_t Kinematics_TrayCrossingsBetween(int32_t from_pulses, int32_t to_pulses);
 
-/* 累计脉冲 -> 当前对准投放点的盒号（就近取整，自动处理整圈回绕） */
-uint8_t Kinematics_TrayBinOf(uint32_t pulses);
+/* 累计脉冲（有符号）-> 当前对准投放点的盒号（就近取整，自动处理整圈回绕/负值） */
+uint8_t Kinematics_TrayBinOf(int32_t pulses);
 
 /**
  * @brief  绝对坐标是否落在工作包络内

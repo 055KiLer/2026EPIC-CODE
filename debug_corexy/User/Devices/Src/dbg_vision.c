@@ -61,6 +61,24 @@ uint32_t Dbg_Vision_NoneCount(void) {
     return s_cnt_empty;
 }
 
+uint32_t Dbg_Vision_BadCount(void) {
+    return s_cnt_bad;
+}
+
+/* ★ 不看新鲜度的缓存快照（见 dbg_vision.h）：read 的"清缓存前本来有没有目标"诊断入口 */
+uint8_t Dbg_Vision_TargetSnapshot(K230_Target_t *out, uint32_t *age_ms) {
+    if (s_target.valid == 0u) {
+        return 0u;
+    }
+    if (out != NULL) {
+        *out = s_target;
+    }
+    if (age_ms != NULL) {
+        *age_ms = HAL_GetTick() - s_target_tick;
+    }
+    return 1u;
+}
+
 void Dbg_Vision_ToMachine(const K230_Target_t *t, float *x_mm, float *y_mm) {
     Dbg_Vision_ToMachineImpl(t, x_mm, y_mm);
 }
@@ -217,6 +235,209 @@ uint8_t Dbg_Vision_Live(uint32_t seconds) {
     Dbg_Printf("[K230] 实时 %us 结束：本段目标 %u 帧（此前 %u）\n", (unsigned)seconds,
                (unsigned)(s_cnt_target - tgt0), (unsigned)tgt0);
     return 1u;
+}
+
+/* 逐帧原样打印（给 `k230 raw` 用）：hex 12 字节 + 解码 + 校验判决。
+   @param force 1 = 无条件逐帧打（头 3 秒，先看清帧结构）；0 = 只打"有信息量"的帧
+                （目标帧/异常帧）；状态 0x00 的帧交给每秒汇总，免得刷屏
+   @retval 帧类别：1=目标帧（含越界）2=状态 00（本帧无目标）3=校验错 4=其它状态 */
+static uint8_t Dbg_Vision_RawFrame(const uint8_t *f, uint8_t force, uint32_t *n_bad,
+                                   uint32_t *n_none) {
+    uint8_t sum = 0u;
+    uint8_t kind;
+
+    for (uint8_t i = 0u; i < 11u; i++) {
+        sum = (uint8_t)(sum + f[i]);
+    }
+
+    /* 先分类计数（与"打不打"无关），再决定打印 */
+    if (sum != f[11]) {
+        (*n_bad)++;
+        kind = 3u;
+    } else if (f[2] == 0x00u) {
+        (*n_none)++;
+        kind = 2u;
+    } else if (f[2] == 0x01u) {
+        kind = 1u;
+    } else {
+        kind = 4u;
+    }
+
+    if ((force == 0u) && (kind == 2u)) {
+        return kind;
+    }
+
+    Dbg_Printf("[RAW] ");
+    for (uint8_t i = 0u; i < 12u; i++) {
+        Dbg_Printf("%02X ", f[i]);
+    }
+
+    if (kind == 3u) {
+        Dbg_Printf("| 校验错（前 11 字节累加 %02X ≠ 帧尾 %02X）——帧长/累加范围与 §4.1 不一致\n",
+                   (unsigned)sum, (unsigned)f[11]);
+        return kind;
+    }
+    if (kind == 2u) {
+        Dbg_Printf("| 状态 00 = 本帧无目标（上位机在说：没有可抓的东西）\n");
+        return kind;
+    }
+    if (kind == 4u) {
+        Dbg_Printf("| 状态 %02X 既不是 00 也不是 01 —— 本机当无目标处理\n", (unsigned)f[2]);
+        return kind;
+    }
+
+    {
+        int16_t       x10 = (int16_t)((uint16_t)f[8] << 8 | f[7]);
+        int16_t       y10 = (int16_t)((uint16_t)f[10] << 8 | f[9]);
+        K230_Target_t t;
+        float         mx = 0.0f;
+        float         my = 0.0f;
+
+        t.valid    = 1u;
+        t.category = f[3];
+        t.shape    = f[4];
+        t.has_qr   = f[5];
+        t.x_mm     = (float)x10 * 0.1f;
+        t.y_mm     = (float)y10 * 0.1f;
+        Dbg_Vision_ToMachineImpl(&t, &mx, &my);
+
+        if ((t.category >= 1u) && (t.category <= (uint8_t)CFG_NUM_CATEGORIES) &&
+            (t.shape <= (uint8_t)CFG_NUM_SHAPES)) {
+            Dbg_Printf("| 目标帧 类别 %u 形状 %u [可用]  帧XY(", (unsigned)t.category,
+                       (unsigned)t.shape);
+        } else {
+            Dbg_Printf("| 目标帧 类别 %u 形状 %u [★越界→本机按设计丢弃]  帧XY(", (unsigned)t.category,
+                       (unsigned)t.shape);
+        }
+        Dbg_Vision_PrintF1(t.x_mm);
+        Dbg_Printf(", ");
+        Dbg_Vision_PrintF1(t.y_mm);
+        Dbg_Printf(") -> 机械(");
+        Dbg_Vision_PrintF1(mx);
+        Dbg_Printf(", ");
+        Dbg_Vision_PrintF1(my);
+        Dbg_Printf(")\n");
+    }
+    return kind;
+}
+
+/* ★ `k230 raw [秒]`：把线上字节按帧原样打出来（hex + 解码 + 校验判决）——线上真相工具。
+   ★ 旁路观察：**不喂解析器、不动缓存与计数**（`live`/快照的计数不受影响），也不消费控制台命令。
+   用途：当 `read`/产品报"没有可用的目标帧"时，用它区分三种线级可能：
+     ① 线上只有状态 0x00 的帧 ⇒ 上位机在说"本帧无目标"（识别/目标挑选）
+     ② 线上有目标帧、但类别/形状越界 ⇒ 本机按设计丢弃（宁可不抓）；hex 里能直接看到那个数字
+     ③ 线上是乱字节/校验不过/根本没有字节 ⇒ 线、波特率、或上位机 TX（再用并口 TTL 复核）
+   头 3 秒逐帧全打（看清帧结构），之后只打目标帧/异常帧 + 每秒按状态分类的汇总。
+   任意键中止（读掉的字节丢弃，不排进命令队列——同 live 口径） */
+uint8_t Dbg_Vision_Raw(uint32_t seconds) {
+    uint8_t  st  = 0u; /* 0=找 AA、1=等 55、2=收载荷 */
+    uint8_t  idx = 0u;
+    uint8_t  buf[12];
+    uint32_t t0;
+    uint32_t next_report;
+    uint32_t n_frame = 0u, n_tgt = 0u, n_none = 0u, n_bad = 0u, n_other = 0u;
+    uint32_t n_bytes = 0u, n_stray = 0u;
+    uint32_t s_frame = 0u, s_tgt = 0u, s_none = 0u, s_bad = 0u, s_other = 0u, s_bytes = 0u;
+
+    if ((seconds == 0u) || (seconds > 120u)) {
+        seconds = 10u;
+    }
+
+    Dbg_Uart_VisionFlush(); /* 从现在开始算，不吃历史积压 */
+    Dbg_Printf("[RAW] 视觉线原始帧 %us：逐帧 hex + 解码（旁路观察，不动缓存/计数）。任意键中止\n",
+               (unsigned)seconds);
+
+    t0          = HAL_GetTick();
+    next_report = t0 + 1000u;
+
+    for (;;) {
+        if (Dbg_Uart_Available() > 0u) { /* 只排空不执行：中止观察不算软急停 */
+            while (Dbg_Uart_Available() > 0u) {
+                (void)Dbg_Uart_ReadByte();
+            }
+            Dbg_Printf("[RAW] 已中止\n");
+            return 1u;
+        }
+
+        while (Dbg_Uart_VisionAvailable() > 0u) {
+            uint8_t b = Dbg_Uart_VisionReadByte();
+
+            n_bytes++;
+            s_bytes++;
+
+            if (st == 0u) {
+                if (b == 0xAAu) {
+                    buf[0] = b;
+                    st     = 1u;
+                } else {
+                    n_stray++; /* 非帧头字节：只计数（帧错位/波特率不对时这里会涨） */
+                }
+            } else if (st == 1u) {
+                if (b == 0x55u) {
+                    buf[1] = b;
+                    idx    = 2u;
+                    st     = 2u;
+                } else if (b == 0xAAu) {
+                    /* 连续 AA：留在本状态重判（同解析器口径） */
+                } else {
+                    st = 0u;
+                    n_stray++;
+                }
+            } else {
+                buf[idx++] = b;
+                if (idx >= 12u) {
+                    uint8_t kind = Dbg_Vision_RawFrame(buf, ((HAL_GetTick() - t0) < 3000u) ? 1u : 0u,
+                                                       &n_bad, &n_none);
+
+                    st = 0u;
+                    n_frame++;
+                    s_frame++;
+                    if (kind == 1u) {
+                        n_tgt++;
+                        s_tgt++;
+                    } else if (kind == 4u) {
+                        n_other++;
+                        s_other++;
+                    } else if (kind == 3u) {
+                        s_bad++;
+                    } else {
+                        s_none++;
+                    }
+                }
+            }
+        }
+
+        if ((int32_t)(HAL_GetTick() - next_report) >= 0) {
+            next_report += 1000u;
+            Dbg_Printf("[RAW] …本秒 帧 %u（目标 %u / 无目标 00 %u / 其它状态 %u / 校验错 %u）字节 %u\n",
+                       (unsigned)s_frame, (unsigned)s_tgt, (unsigned)s_none, (unsigned)s_other,
+                       (unsigned)s_bad, (unsigned)s_bytes);
+            s_frame = 0u;
+            s_tgt   = 0u;
+            s_none  = 0u;
+            s_other = 0u;
+            s_bad   = 0u;
+            s_bytes = 0u;
+        }
+
+        if ((HAL_GetTick() - t0) > (seconds * 1000u)) {
+            Dbg_Printf("[RAW] %us 结束：帧 %u（目标 %u / 无目标 00 %u / 其它状态 %u / 校验错 %u）"
+                       "字节 %u 散字节 %u\n",
+                       (unsigned)seconds, (unsigned)n_frame, (unsigned)n_tgt, (unsigned)n_none,
+                       (unsigned)n_other, (unsigned)n_bad, (unsigned)n_bytes, (unsigned)n_stray);
+            if (n_frame == 0u) {
+                Dbg_Printf("[RAW] ⚠️ 一帧都没组出来（散字节 %u）——先查线/波特率/上位机 TX\n",
+                           (unsigned)n_stray);
+            } else if (n_bad == n_frame) {
+                Dbg_Printf("[RAW] ⚠️ 全是校验错——帧在线上，但帧长或累加范围与 §4.1 不一致\n");
+            } else if (n_none == n_frame) {
+                Dbg_Printf("[RAW] ⚠️ 全是本帧无目标（状态 00）——帧到得好好的，是上位机没把物块当目标\n");
+            } else if (n_tgt > 0u) {
+                Dbg_Printf("[RAW] 线上有目标帧（见上面 [RAW] 目标帧 行）——核它的类别/形状与坐标\n");
+            }
+            return 1u;
+        }
+    }
 }
 
 void Dbg_Vision_SimFeed(uint8_t category, uint8_t shape, float x_mm, float y_mm) {

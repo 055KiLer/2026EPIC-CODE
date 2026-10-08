@@ -193,17 +193,40 @@ static uint8_t Sort_DoCycle(const K230_Target_t *target) {
        3mm 内收，物块贴外沿映射到 (0,+3] 时机构仍可达，钳回 0 就近夹取；超过 = 标定/
        镜像问题，作废本件（上位机会持续重报同一目标 → 表现为"机器不动"——先核物块
        是不是贴边 + 坐标微微越界，别当成新鲜度问题排查）。同样无在途动作，无需 settle */
+    /* ★ 极限位夹取带（2026-10-08 用户口径："y 轴过于偏夹不到——到限位之后就按最极限的位置，
+       不管怎么样都直接夹"）：带内（上限 + 带值 之内）不再作废，钳到极限位照样伸爪
+       （下面还有"保护边距"再让开 CFG_WORK_EDGE_MARGIN_MM）；带外才作废本件。
+       带值 = 0 时退化成旧的"只允许 CFG_WORK_OVERSHOOT_MM 微越界"口径 */
+    float band_x = (CFG_XY_X_CLAMP_BAND_MM > CFG_WORK_OVERSHOOT_MM) ? CFG_XY_X_CLAMP_BAND_MM
+                                                                   : CFG_WORK_OVERSHOOT_MM;
+    float band_y = (CFG_XY_Y_CLAMP_BAND_MM > CFG_WORK_OVERSHOOT_MM) ? CFG_XY_Y_CLAMP_BAND_MM
+                                                                   : CFG_WORK_OVERSHOOT_MM;
+
     if (target_x > CFG_WORK_X_MAX_MM) {
-        if (target_x > CFG_WORK_X_MAX_MM + CFG_WORK_OVERSHOOT_MM) {
-            return 0u;
+        if (target_x > CFG_WORK_X_MAX_MM + band_x) {
+            return 0u; /* 超出延伸带：夹爪也够不着 */
         }
         target_x = CFG_WORK_X_MAX_MM;
     }
     if (target_y > CFG_WORK_Y_MAX_MM) {
-        if (target_y > CFG_WORK_Y_MAX_MM + CFG_WORK_OVERSHOOT_MM) {
+        if (target_y > CFG_WORK_Y_MAX_MM + band_y) {
             return 0u;
         }
         target_y = CFG_WORK_Y_MAX_MM;
+    }
+
+    /* ★ 限位开关保护边距（2026-10-08）：X/Y 最大端就是回零开关所在处（触发点 = 坐标 0 + 3mm），
+       上面那条"微越界钳位"却会把龙门**指到 0**——等于每抓一次贴边件就朝开关顶满最后 3mm。
+       纯开环的漂移/丢步（或跳齿）一旦吃掉这 3mm，开关真被压下 ⇒ 守护任务按"真撞限位"
+       作废 XY 记账 ⇒ 下一圈重新回零（现场看到的"抓完自己回零校准"）。这里把落在保护边距内
+       的目标回拉到 `上限 − 边距`——夹爪有 ~25mm 延伸带（CFG_XY_X_CLAMP_MM 一节），
+       少走 5mm 照样夹得住，换来"永远不朝开关方向顶满"。只作用于最大端：-Y 下限 = 投放点
+       必须走满、-X 走延伸带，都不受影响 */
+    if (target_x > (CFG_WORK_X_MAX_MM - CFG_WORK_EDGE_MARGIN_MM)) {
+        target_x = CFG_WORK_X_MAX_MM - CFG_WORK_EDGE_MARGIN_MM;
+    }
+    if (target_y > (CFG_WORK_Y_MAX_MM - CFG_WORK_EDGE_MARGIN_MM)) {
+        target_y = CFG_WORK_Y_MAX_MM - CFG_WORK_EDGE_MARGIN_MM;
     }
 
     /* 步骤2+3：转盘预定位（异步）与 XY 移动并行，谁慢等谁 */

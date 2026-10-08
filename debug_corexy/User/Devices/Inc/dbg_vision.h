@@ -30,6 +30,17 @@ void Dbg_Vision_Print(void);
 uint8_t Dbg_Vision_Live(uint32_t seconds);
 
 /**
+ * @brief  ★`k230 raw [秒]`：线上真相工具——把字节按帧原样打出来（hex 12 字节 + 解码 + 校验判决）。
+ *         旁路观察：不喂解析器、不动缓存与计数（`live`/快照的计数不受影响）。
+ *         用途：`read` 报"没有可用的目标帧"时，用它区分线级三可能——
+ *         ① 线上只有状态 0x00 的帧（上位机说"本帧无目标"）② 有目标帧但类别/形状越界
+ *         （本机按设计丢弃，hex 里能看到那个数字）③ 乱字节/校验不过/没有字节（线/波特率/TX）。
+ *         头 3 秒逐帧全打，之后只打目标帧/异常帧 + 每秒按状态分类的汇总。
+ * @param  seconds 1~120，0 = 默认 10；任意键中止
+ */
+uint8_t Dbg_Vision_Raw(uint32_t seconds);
+
+/**
  * @brief  `k230 sim <类别1~6> <x_mm> <y_mm> [形状0~3]`：本地合成一帧 12 字节（校验和自动算）
  *         从解析器入口喂进去——不接线也能验"解析 -> 缓存 -> 换算"整条链
  * @param  shape 缺省 0（默认方案）；1=立方体 2=12面体 3=六棱柱；给 4+ 可验越界路径
@@ -50,6 +61,16 @@ uint8_t Dbg_Vision_GetTarget(K230_Target_t *out);
 
 /* 无目标帧累计数（清缓存后重新计）——等待目标时的进度显示用 */
 uint32_t Dbg_Vision_NoneCount(void);
+
+/* 目标帧**越界**累计数（类别不在 1~6、或形状不在 0~3）——"无新鲜帧"分诊用：
+   越界 > 0 = 上位机其实在报目标，只是编码口径与产品不一致（不是"没识别到"） */
+uint32_t Dbg_Vision_BadCount(void);
+
+/* ★缓存快照（**不看新鲜度**）：缓存里记着目标就返回 1，并把目标与"多少 ms 前到的"写出来。
+   与 Dbg_Vision_GetTarget 的区别 = 后者按 ≤CFG_K230_TARGET_FRESH_MS 过滤（= 产品取帧口径）；
+   本接口只回答"清缓存前到底有没有目标、它多久前到的"——`read` 靠它把"流里刚有、现在断了"
+   与"一直就没有可用目标帧"分开，再配 `k230`/`k230 raw` 定到具体哪一条 */
+uint8_t Dbg_Vision_TargetSnapshot(K230_Target_t *out, uint32_t *age_ms);
 
 /* 视觉系 -> 机械系换算（与产品 Vision_ToMachine 逐字同口径） */
 void Dbg_Vision_ToMachine(const K230_Target_t *t, float *x_mm, float *y_mm);

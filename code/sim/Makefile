@@ -34,7 +34,7 @@ CFLAGS   += $(DEPFLAGS)
 OBJ_FILL := $(addprefix out/fill/,$(NAMES:.c=.o))
 OBJ_ZERO := $(addprefix out/zero/,$(NAMES:.c=.o))
 
-SCENES   := s1 s2 s3 s6 s7 s8 s9 s10 s11 s12 s13 s14 s15 s16 s17 s19
+SCENES   := s1 s2 s3 s6 s7 s8 s9 s10 s11 s12 s13 s14 s15 s16 s17 s19 s20 s21 s22 s23
 
 
 all: out/sim out/sim_zero

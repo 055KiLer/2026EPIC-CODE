@@ -21,6 +21,8 @@ typedef struct {
 
 static volatile uint32_t s_events;
 static volatile uint32_t s_tray_index_cnt;
+/* ★ 转盘索引沿"待确认"时刻（≠0 = 收到一个沿、正在等电平确认压住才计数） */
+static volatile uint32_t s_idx_pending_tick;
 static Bsp_LimDbc_t s_lim_x;
 static Bsp_LimDbc_t s_lim_y;
 static Bsp_LimDbc_t s_tray_idx;
@@ -83,11 +85,30 @@ void Bsp_Gpio_Poll(void) {
             st->armed = 1u;
         }
     }
+
+    /* ★ 转盘索引沿的电平确认（2026-10-08）：实测压住 ≥CFG_TRAY_INDEX_CONFIRM_MS 才计入
+       按压计数；窗内电平始终松开 = 电气毛刺，丢弃（不然复核会误判成丢步、白跑一次回零） */
+    if (s_idx_pending_tick != 0u) {
+        if (Bsp_Gpio_TrayOrigin() != 0u) {
+            if ((now - s_idx_pending_tick) >= CFG_TRAY_INDEX_CONFIRM_MS) {
+                s_idx_pending_tick = 0u;
+                s_tray_index_cnt++;
+                s_events |= BSP_GPIO_EVT_TRAY_INDEX;
+            }
+        } else if ((now - s_idx_pending_tick) > CFG_TRAY_INDEX_CONFIRM_MS) {
+            s_idx_pending_tick = 0u; /* 毛刺：电平已松开，不算一次按压 */
+        }
+    }
 }
 
 /* X/Y 限位合成同一事件：CoreXY 两轴必须一起停才不会歪。
    未武装（没确认过松开/仍在压着/40ms 内的重复沿）一律不锁存——真按压一定是
-   "武装状态下的一次下降沿"，弹跳和松开沿全被两道门拦下 */
+   "武装状态下的一次下降沿"，弹跳和松开沿全被两道门拦下。
+   ★ 2026-10-08：撞限位的**判据已移到 App**（Motion_ServeEvents 改看"电平连续压住"，
+   沿闩锁会把电流尖峰耦合出的假沿当成真撞，见 sort_config.h 该常量一节）；本事件位
+   从此只承担"按压发生过"这条诊断语义，**不再是急停/作废记账的依据**。两道门与计数
+   原样保留：它们定义的正是"按压"这个语义，且与台架 dbg_gpio（`lim` 命令）同构，
+   台架与产品能逐条对表 */
 void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin) {
     if (GPIO_Pin == CFG_LIMIT_PIN_X || GPIO_Pin == CFG_LIMIT_PIN_Y) {
         Bsp_LimDbc_t *st  = (GPIO_Pin == CFG_LIMIT_PIN_X) ? &s_lim_x : &s_lim_y;
@@ -104,7 +125,10 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin) {
         s_events |= BSP_GPIO_EVT_XY_LIMIT;
     } else if (GPIO_Pin == CFG_ORIGIN_PIN_TRAY) {
         /* 弹跳灌进第二次沿，App 的整圈核对就永远对不上，每次定位都会被误判成丢步
-           ——与 X/Y 同款两道门（台架 dbg_gpio 同构，见文件头实测依据） */
+           ——与 X/Y 同款两道门（台架 dbg_gpio 同构，见文件头实测依据）。
+           ★ 2026-10-08 再加一道"电平确认"（计数交给 Bsp_Gpio_Poll）：一次电气毛刺同样能
+           造出这里的一次下降沿，灌进整圈核对 ⇒ 复核不过 ⇒ 转盘白跑一次回零（现场现象）。
+           真凸块压住开关几百 ms，毛刺 µs 级 ⇒ 只把"电平持续压住"的沿计入 s_tray_index_cnt */
         Bsp_LimDbc_t *st  = &s_tray_idx;
         uint32_t      now = HAL_GetTick();
 
@@ -114,9 +138,8 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin) {
         if ((now - st->last_accept) < CFG_LIMIT_DEBOUNCE_MS) {
             return;
         }
-        st->last_accept = now;
-        st->armed       = 0u;
-        s_tray_index_cnt++;
-        s_events |= BSP_GPIO_EVT_TRAY_INDEX;
+        st->last_accept        = now;
+        st->armed              = 0u;
+        s_idx_pending_tick     = now; /* 待确认（确认在 Poll 里做，见 CFG_TRAY_INDEX_CONFIRM_MS） */
     }
 }

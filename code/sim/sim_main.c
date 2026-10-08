@@ -46,6 +46,7 @@ typedef enum
     EV_MOTOR_BLOCK,    /* val: 电机号 0/1/2，-1=解除 */
     EV_SERIAL_DEAD,    /* val: 串口号 0~5，-1=解除全部 */
     EV_LIMIT_X,        /* val: 0=正常 1=常闭 2=断线 */
+    EV_LIMIT_GLITCH,   /* val: 0=X 1=Y —— 纯电气毛刺：只灌一次"下降沿"，开关电平一动不动 */
     EV_RELOAD,         /* val: 追加几件货 */
     EV_STOP            /* val: 无 —— 到这里就可以收工 */
 } evt_what_e;
@@ -190,6 +191,15 @@ static void apply_event(const evt_t *e)
         g_sim.limit_x_dead = (uint8_t)(e->val == 2);
         printf("\n>>> [注入] t=%ums X 限位 -> %s\n\n", e->at_ms,
                e->val == 1 ? "常闭（永远触发）" : (e->val == 2 ? "断线（永远不触发）" : "正常"));
+        break;
+    case EV_LIMIT_GLITCH:
+        /* 现场机制（2026-10-08 用户报"抓完之后有时自己回零校准"）：舵机/电机换向的电流
+           尖峰耦合进限位线，EXTI 收到一次下降沿，但开关**机械上没被碰**（电平一动不动）。
+           这里就是那个"只灌沿、不动电平"的注入——与真撞（update_switches 里电平跟着变）
+           构成对照，见 s23。sim_raise_exti 走的就是真沿那条路（排队 → HAL_GPIO_EXTI_Callback） */
+        sim_raise_exti((e->val == 0) ? CFG_LIMIT_PIN_X : CFG_LIMIT_PIN_Y);
+        printf("\n>>> [注入] t=%ums %c 限位**电气毛刺**（只灌一次沿，开关电平不动）\n\n", e->at_ms,
+               (e->val == 0) ? 'X' : 'Y');
         break;
     case EV_RELOAD:
         printf("\n>>> [注入] t=%ums 人工再放入 %d 件货\n\n", e->at_ms, e->val);
@@ -756,6 +766,174 @@ static int v_s19(void)
     return bad;
 }
 
+/* --- S20 转盘双向走最近路径（2026-10-08"可以顺逆时针转"）：**强制反向路径** ---
+ * 货物按 类别 1,6,1,6,1,6 交替布 ⇒ 盒号走 0,5,0,5,0,5：0→5 的最近路径是**反向 1 格**
+ * （正转要 5 格）。判据 = s1 同款（每件都进对盒、不抓空、记账不作废）；
+ * 反向那几笔顺带把"有符号脉冲记账 + 双向凸块计数（Kinematics_TrayCrossingsBetween）"跑一遍。
+ * CFG_TRAY_ALLOW_REVERSE=0 时本场景也应全过（退化成单向正转，只是慢）。 */
+static void s20_setup(void)
+{
+    for (int i = 0; i < 6; i++) {
+        float   x     = -125.0f + 28.0f * (float)(i % 5);
+        float   y     = -170.0f + 55.0f * (float)(i / 5);
+        uint8_t cat   = (uint8_t)(((i % 2) == 0) ? 1 : 6); /* 盒号 0/5 交替 ⇒ 强制反向 */
+        uint8_t shape = (uint8_t)(i % 4);
+
+        add_item(x, y, cat, shape, (uint8_t)((i % 2) == 0));
+    }
+}
+
+static int v_s20(void)
+{
+    int bad = 0;
+
+    if (g_res.items_done != 6) {
+        printf("  [FAIL] 入盒 %d != 6（反向路径没走通？）\n", g_res.items_done);
+        bad++;
+    }
+    if (g_res.items_empty_grab != 0) {
+        printf("  [FAIL] 出现 %d 次抓空\n", g_res.items_empty_grab);
+        bad++;
+    }
+    if (g_res.tray_untrust_events != 0) {
+        printf("  [FAIL] 转盘记账被作废 %d 次（反向路径的凸块/脉冲复核不过）\n",
+               g_res.tray_untrust_events);
+        bad++;
+    }
+    if (g_res.hard_stop_hits != 0) {
+        printf("  [FAIL] 顶到机械硬限位 %d 次\n", g_res.hard_stop_hits);
+        bad++;
+    }
+    bad += check_bins();
+    bad += check_screen_counts();
+    return bad;
+}
+
+
+/* --- S21 贴边物块（目标坐标落在限位开关那一侧）---
+ * 布货（真值机械坐标）：物块落在 X ≈ -10 一带 ⇒ 经"视觉标定（模型真值 -80,-45 vs 产品 -70,-57.5）"
+ * 换算到机器侧就是 X ≈ 0（含一个落到越界带、会被钳回 0 的）。
+ * 旧口径（钳回 0 就近抓）= **命令龙门走到坐标 0**，而 0 就是回零开关触发线 ⇒ 龙门真压上开关
+ * ⇒ 守护任务作废 XY 记账 ⇒ 下一圈重新回零（现场"抓完自己回零校准"）。
+ * CFG_WORK_EDGE_MARGIN_MM 把目标回拉到 -5 ⇒ 同一件照样夹得住（夹爪 25mm 延伸带），开关不再被压。
+ * 判据：两件都进对盒、且 **XY 记账一次都没被作废**（作废 = 真压上开关）。 */
+static void s21_setup(void)
+{
+    add_item(-10.0f, -100.0f, 1u, 0u, 0u); /* 机器侧 X ≈ 0（钳回带上） */
+    add_item(-9.0f, -60.0f, 2u, 1u, 1u);   /* 机器侧 X ≈ +1（微越界钳位带上） */
+    /* 回零完成之后注入 2mm 开环丢步：钳位到 0 的目标会让真实位置顶到 +2 ⇒ 压上开关 */
+}
+
+static int v_s21(void)
+{
+    int bad = 0;
+
+    if (g_res.items_done != 2) {
+        printf("  [FAIL] 入盒 %d != 2（贴边件没抓成？）\n", g_res.items_done);
+        bad++;
+    }
+    if (g_res.xy_untrust_events != 0) {
+        printf("  [FAIL] XY 记账被作废 %d 次 = 龙门真压上了回零开关（贴边件的目标坐标上了限位线）\n",
+               g_res.xy_untrust_events);
+        bad++;
+    }
+    if (g_res.tray_untrust_events != 0) {
+        printf("  [FAIL] 转盘记账被作废 %d 次\n", g_res.tray_untrust_events);
+        bad++;
+    }
+    if (g_res.hard_stop_hits != 0) {
+        printf("  [FAIL] 顶到机械硬限位 %d 次\n", g_res.hard_stop_hits);
+        bad++;
+    }
+    bad += check_bins();
+    bad += check_screen_counts();
+    return bad;
+}
+
+/* --- S22 极限位夹取带（+Y 侧）：夹不到也去夹 ---
+ * 布货（真值机械坐标）：物块落在 Y ≈ +20 一带，经视觉标定换算到机器侧 Y ≈ +8
+ * （超出旧的 3mm 微越界口径、在 25mm 带内）。
+ * 旧口径 = 整件作废、机器不干等；新口径 = 钳到最极限可达位（上限 − 保护边距）**照样伸爪**
+ * ⇒ 必然夹偏 ⇒ 记一次抓空（用户口径："不管怎么样都直接夹"，宁可试一把）。
+ * 判据：**至少伸爪尝试过一次**（抓空计数 ≥1）+ 记账不被作废（钳位目标在开关余量之外）。 */
+static void s22_setup(void)
+{
+    add_item(-60.0f, 20.5f, 1u, 0u, 0u); /* 机器侧 (X≈-50, Y≈+8)：带内、超出 3mm 口径 */
+}
+
+static int v_s22(void)
+{
+    int bad = 0;
+
+    /* 本场景要验的就是"夹不到也去夹"：物块在机器侧 Y ≈ +8（超出旧的 3mm 微越界口径），
+       带内 ⇒ 产品应钳到极限位**伸爪尝试**（这就必然夹偏 ⇒ 记为一次抓空）；带值 = 0 时
+       会整件作废 ⇒ 一次尝试都没有 ⇒ 这条断言正好把新旧口径分开 */
+    if (g_res.items_empty_grab < 1) {
+        printf("  [FAIL] 一次都没伸爪（抓空计数 %d）——极限位夹取带没生效（旧口径会整件作废）\n",
+               g_res.items_empty_grab);
+        bad++;
+    }
+    if (g_res.xy_untrust_events != 0) {
+        printf("  [FAIL] XY 记账被作废 %d 次（钳位目标仍顶到了限位开关？）\n", g_res.xy_untrust_events);
+        bad++;
+    }
+    if (g_res.tray_untrust_events != 0) {
+        printf("  [FAIL] 转盘记账被作废 %d 次\n", g_res.tray_untrust_events);
+        bad++;
+    }
+    return bad;
+}
+
+/* --- S23 限位电气毛刺（假"撞限位"）---
+ * 现场现象（2026-10-08 用户）：①"抓完之后有时自己回零校准" ②"一上来连夹持点都到不了"。
+ * 机制：EXTI 只认"武装状态下的一次下降沿"，舵机/电机换向的电流尖峰耦合进限位线就能造出
+ * 假沿。旧口径（沿闩锁 ⇒ 急停 + 作废记账）每来一次毛刺就白跑一次回零；更糟的是若"停止帧
+ * 立即发、记账晚一点才作废"那种拆分口径：毛刺被判成假之后记账被保留、运动却已被截在半路
+ * ⇒ 记账说"已到位"、实物停在半路 ⇒ **坐标系静默平移**（越抓越歪、最后朝开关顶）。
+ * 本场景：料盘 6 件照常运行，途中灌 4 次**纯电气沿**（开关电平一动不动，见 EV_LIMIT_GLITCH）。
+ * 判据（把新旧口径分开的那一条）：**XY 记账一次都没被作废** + 6 件全部进对盒 + 不顶硬限位。
+ * 反证（对照，实测过）：把 Motion_ServeEvents 退回"沿闩锁"口径 ⇒ 本场景立即变红
+ * （xy_untrust ≥1、且白跑一次回零）。 */
+static void s23_setup(void)
+{
+    load_default_lot(12); /* 跑满 12 件（≈90s）：4 次毛刺都落在"运动中/运动中段"，不是空转期 */
+    evt_add(40000u, EV_LIMIT_GLITCH, 0);
+    evt_add(55000u, EV_LIMIT_GLITCH, 1);
+    evt_add(70000u, EV_LIMIT_GLITCH, 0);
+    evt_add(85000u, EV_LIMIT_GLITCH, 1);
+}
+
+static int v_s23(void)
+{
+    int bad = 0;
+
+    if (g_res.xy_untrust_events != 0) {
+        printf("  [FAIL] XY 记账被作废 %d 次 = 毛刺被当成真撞（判据退回沿闩锁了？）"
+               "——现场表现就是白跑一次回零\n", g_res.xy_untrust_events);
+        bad++;
+    }
+    if (g_res.items_done != 12) {
+        printf("  [FAIL] 入盒 %d != 12（毛刺不该让任何一件作废，也不该漂位）\n", g_res.items_done);
+        bad++;
+    }
+    if (g_res.items_empty_grab != 0 || g_res.items_dropped_outside != 0) {
+        printf("  [FAIL] 抓空 %d 次 / 非法落点 %d 次（坐标漂了？）\n",
+               g_res.items_empty_grab, g_res.items_dropped_outside);
+        bad++;
+    }
+    if (g_res.hard_stop_hits != 0) {
+        printf("  [FAIL] 顶到机械硬限位 %d 次\n", g_res.hard_stop_hits);
+        bad++;
+    }
+    if (g_res.tray_untrust_events != 0) {
+        printf("  [FAIL] 转盘记账被作废 %d 次\n", g_res.tray_untrust_events);
+        bad++;
+    }
+    bad += check_bins();
+    bad += check_screen_counts();
+    return bad;
+}
+
 static scenario_t s_sc[] = {
     { "s1",  "正常路径 12 件",                 600000u, 12, s1_setup,  v_all_in_right_bin },
     { "s2",  "只放 3 件，跑完后等待",          150000u, 0,  s2_setup,  v_s2 },
@@ -773,6 +951,10 @@ static scenario_t s_sc[] = {
     { "s16", "转盘方向标定反了",              600000u, 12, s16_setup, v_s16 },
     { "s17", "每圈 6 个索引沿",               300000u, 0,  s17_setup, v_s17 },
     { "s19", "屏指令半截帧（静默丢一次发送）",   120000u, 2,  s19_setup, v_s19 },
+    { "s20", "转盘双向最近路径（强制反向）",    300000u, 6,  s20_setup, v_s20 },
+    { "s21", "贴边件不上限位线（保护边距）",    150000u, 2,  s21_setup, v_s21 },
+    { "s22", "极限位夹取带（夹不到也去夹）",  120000u, 0,  s22_setup, v_s22 },
+    { "s23", "限位电气毛刺不假急停（电平连续才认）", 300000u, 12, s23_setup, v_s23 },
 };
 
 static void list_scenarios(void)
