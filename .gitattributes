@@ -1,0 +1,20 @@
+# 行尾统一约定（2026-10-08）
+#
+# 为什么需要这一行：本工程在 Windows 侧用 Keil / VS Code 编辑，git 却在 WSL 里跑。
+# 没声明 text 属性时，工作区被编辑器写成 CRLF、索引里存的是 LF，两边一比就"全部已修改"
+# ——曾一次刷出 61 个纯行尾假改动，真实改动被淹没，提交时极易漏改或误提交。
+#
+# 规则：仓库内一律存 LF；检出到工作区时按本机平台转换（Windows=CRLF、WSL/Linux=LF）。
+# 于是 Windows 上的 Keil 照样拿到 CRLF、git status 只看真实改动，两边都满意。
+* text=auto
+
+# 二进制：任何时候都不做行尾转换（text=auto 本就会按 NUL 字节识别，
+# 这里显式列出常见类型，避免以后加图片/压缩包时依赖启发式判断）
+*.png   -text
+*.jpg   -text
+*.jpeg  -text
+*.gif   -text
+*.pdf   -text
+*.zip   -text
+*.xlsx  -text
+*.docx  -text

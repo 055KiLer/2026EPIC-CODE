@@ -1,1 +1,7 @@
+# 行尾统一约定（2026-10-08）：仓库内一律存 LF，检出时按本机平台转换。
+# 没这一行时，Windows 编辑器写出的 CRLF 会让整个工程显示成"已修改"
+# （曾一次刷出 45 个纯行尾假改动，真实改动被淹没）——详见仓库根 .gitattributes 的说明。
+* text=auto
+
+# 仿真台 Makefile 必须在任何平台上都是 LF：它是给 WSL/Linux 的 make 读的
 sim/Makefile text eol=lf
