@@ -29,6 +29,9 @@ plant_cfg_t g_plant;
 #define LIM_X_PIN   CFG_LIMIT_PIN_X
 #define LIM_Y_PIN   CFG_LIMIT_PIN_Y
 #define TRAY_PIN    CFG_ORIGIN_PIN_TRAY
+/* ★ 投放点激光检测（2026-10-09）：引脚/端口同样跟随产品配置（端口在 sim_plant_pin_read
+   里按 CFG_LASER_GPIO 比）——换脚只改 Config/sort_config.h 一处 */
+#define LASER_PIN   CFG_LASER_PIN
 
 /* 与产品侧同理：引脚号比较**不能写成 #if** —— HAL 的 GPIO_PIN_n 是 ((uint16_t)0x....)，
    预处理阶段不是合法常量表达式。断言失败 = "array size is negative"（2026-09-15 踩过：
@@ -66,7 +69,8 @@ static int claw_is_close_us(uint32_t us)
 
 /* 形状 -> 该形状应有的夹紧脉宽（仿真"真值"，与产品同源：0 = 默认、1~3 = CFG_GRIP_* 表）。
    try_grab 用它判"实发夹紧值 = 本物块形状对应的方案"——产品若把形状索引搞错
-   （拿另一形状的方案去夹），判不匹配 = 抓取失败、场景红，是形状路由的唯一自动化防线 */
+   （拿另一形状的方案去夹），判不匹配 = 抓取失败、场景红，是形状路由的自动化防线之一
+   （另一处 = 初夹档，见 expected_half_us） */
 static uint32_t expected_close_us(uint8_t shape)
 {
     static const uint32_t close_us[CFG_NUM_SHAPES] = CFG_GRIP_CLOSE_US;
@@ -78,6 +82,25 @@ static uint32_t expected_close_us(uint8_t shape)
         return 0u; /* 越界形状不该被产品接单：任何实发值都不会匹配 */
     }
     return close_us[shape - 1u];
+}
+
+/* 形状 -> 该形状应有的**初夹**脉宽（同源真值）。时序硬约束 = "到点先按形状初夹、再下放"
+   （sort_config.h 抓取时序一节）：初夹档错（角度不合会把块顶歪）或整个缺掉 HALF 预夹步
+   （对着货直接合到夹紧）都会抓不牢 —— 与夹紧档错同一后果，try_grab 一并判失败。
+   ★ 2026-10-10 加这道校验的缘由：六棱柱夹紧提到与十二面体同档（都 2050）之后，
+     "只比对夹紧档"分辨不出形状 2↔3 互换（两形状只剩初夹档不同：1900 vs 1800）；
+     顺带把 10-01 审计手工发现的"缺 HALF 预夹步"这类缺陷也钉进自动化 */
+static uint32_t expected_half_us(uint8_t shape)
+{
+    static const uint32_t half_us[CFG_NUM_SHAPES] = CFG_GRIP_HALF_US;
+
+    if (shape == 0u) {
+        return (uint32_t)CFG_CLAW_HALF_US;
+    }
+    if (shape > (uint8_t)CFG_NUM_SHAPES) {
+        return 0u;
+    }
+    return half_us[shape - 1u];
 }
 
 /* ==================== 电机 ==================== */
@@ -99,6 +122,9 @@ static unsigned s_tray_edges;   /* 索引上升沿计数（仅诊断用） */
 /* ==================== 龙门 / 开关真值 ==================== */
 static double s_x_mm, s_y_mm;
 static int s_lim_x, s_lim_y, s_tray_sw;
+/* ★ 投放点激光检测（2026-10-09）：落料脉冲的结束时刻（µs，仿真时钟；0 = 光路是通的）。
+   机制与判据见下方"投放点激光检测"一节 */
+static uint64_t s_laser_pulse_until_us;
 
 /* ==================== 货物 ==================== */
 enum { IT_TRAY = 0, IT_HELD, IT_BIN, IT_LOST };
@@ -154,7 +180,7 @@ typedef char sim_plant_assert_tjc_rows[(CFG_NUM_CATEGORIES == 6) ? 1 : -1];
 static void tjc_parse(const char *s);
 static void rx_push(int id, uint8_t b);
 static void servo_poll(void);
-static void try_grab(uint32_t claw_us);
+static void try_grab(uint32_t claw_us, uint32_t claw_before);
 static void release_item(uint32_t claw_us);
 
 /* ==================== 复位 ==================== */
@@ -188,6 +214,9 @@ void sim_plant_reset(void)
     g_plant.drop_x      = -70.0f;
     g_plant.drop_y      = -187.0f;
     g_plant.vision_err_mm = 0.0;
+    g_plant.laser_pulse_ms = 20.0; /* 落料脉冲宽度（台架 `laser drop` 实测 ≈1µs 窄事件）。
+                                      产品侧 CFG_LASER_ENABLE=0（2026-10-10 起）⇒ 当前不参与
+                                      计数判定；模型与注入保留（台架是激光的验收工具） */
     /* 视觉标定真值：视觉原点（标定中心）在机械坐标系里 = (-80,-45)（2026-10-01 台架实测），
        两个方向符号都为正 —— 与 shim/sort_config.h 的 SIM_VISION_* 必须逐字一致（sim_main 启动时比较） */
     g_plant.vision_origin_x_mm = -80.0;
@@ -199,6 +228,7 @@ void sim_plant_reset(void)
     s_x_mm = g_plant.home_x_mm;
     s_y_mm = g_plant.home_y_mm;
     s_lim_x = s_lim_y = s_tray_sw = 0;
+    s_laser_pulse_until_us = 0;
     s_item_n = 0;
     s_held = -1;
     s_last_lift = 0xFFFFFFFFu;
@@ -239,6 +269,38 @@ void sim_load_items(const sim_item_t *items, int n)
 }
 
 int sim_item_count(void) { return s_item_n; }
+
+/* ★ 人工再放货（2026-10-10 数量复核的补货场景）：**追加**货物，不动已在托盘/已入盒的件
+   （s2 式"清空后再放货"用的是 sim_load_items 整体重载——那会把已入盒的件复活到托盘上，
+   只能在上电时用）。数量位模型因此直接取"托盘上还剩几件"，补货后自动 +N */
+int sim_plant_add_items(const sim_item_t *items, int n)
+{
+    int added = 0;
+
+    for (int i = 0; i < n && s_item_n < SIM_MAX_ITEMS; i++) {
+        s_item[s_item_n].spec = items[i];
+        s_item[s_item_n].x = items[i].item_x_mm;
+        s_item[s_item_n].y = items[i].item_y_mm;
+        s_item[s_item_n].state = IT_TRAY;
+        s_item[s_item_n].bin = -1;
+        s_item_n++;
+        added++;
+    }
+    return added;
+}
+
+/* 托盘上还剩几件（数量位模型的真值 = 相机该数到的数） */
+int sim_plant_tray_count(void)
+{
+    int c = 0;
+
+    for (int i = 0; i < s_item_n; i++) {
+        if (s_item[i].state == IT_TRAY) {
+            c++;
+        }
+    }
+    return c;
+}
 
 int sim_items_remaining(void)
 {
@@ -368,6 +430,42 @@ static void update_switches(void)
     s_tray_sw = nt;
 }
 
+/* ==================== 投放点激光检测 ==================== */
+/* ★ 2026-10-09 现场口径（用户实测）：模块在投放点看的是"**落料**"这个瞬间——物块落下穿过
+   光路 = 一段**短脉冲**（检测到 = 低电平），不是"爪里挂着的货"；而且落料很快 ⇒ 脉冲很短。
+   模型因此押在"松爪落料"上：**只有货真的在投放点范围内落下才产生脉冲**，宽度由
+   g_plant.laser_pulse_ms 给。抓空（爪里本来没货）与"落点偏出投放区"都没有脉冲。
+   ★ 2026-10-10：产品侧 CFG_LASER_ENABLE=0（爪挡光路 ⇒ 判据换成数量复核）⇒ 仿真台
+     两个宏都钉成现场配置（见 shim/sort_config.h），这段模型与 laser_dead/stuck 注入
+     保留但当前不参与计数判定——激光的验收工具是台架 `laser drop`/`laser verify` */
+static void laser_trigger_pulse(void)
+{
+    uint64_t until = sim_now_us_get() + (uint64_t)(g_plant.laser_pulse_ms * 1000.0);
+
+    if (until > s_laser_pulse_until_us) {
+        s_laser_pulse_until_us = until;
+    }
+    /* ★ 沿也要给：产品侧取证据靠 **EXTI 下降沿计数**（台架实测落料 ≈1µs 窄事件，
+       1ms 电平轮询抓不到，见 sort_config.h 该节）。模型只给"检测到"到来那一个**下降沿**
+       （真机 gpio.c 配的就是 IT_FALLING）；收尾的上沿不给——真机没配，给了会让产品计数凭空 +1
+       （与 update_switches 给限位只灌"压下"那一侧同一条纪律） */
+    if (g_sim.laser_dead != 0u) {
+        return; /* 断线/模块坏：光路给不出**任何**证据——沿也不能给（s25 抓的就是这条） */
+    }
+    sim_raise_exti(LASER_PIN);
+}
+
+static int laser_detected(void)
+{
+    if (g_sim.laser_stuck != 0u) {
+        return 1; /* 卡在"检测到"：夹空会漏放（虚增方向）——注入用来演示这一侧的盲区 */
+    }
+    if (g_sim.laser_dead != 0u) {
+        return 0; /* 断线/没对准/极性反/模块坏：永远读不到（s25 是它的症状冻结） */
+    }
+    return (sim_now_us_get() < s_laser_pulse_until_us) ? 1 : 0;
+}
+
 int sim_plant_pin_read(void *port, uint16_t pin)
 {
     /* 常开 + 上拉：未压下=高，压下=低。产品侧 CFG_LIMIT_ACTIVE_LEVEL=RESET 与
@@ -381,6 +479,16 @@ int sim_plant_pin_read(void *port, uint16_t pin)
     }
     if (port == (void *)&sim_GPIOB && pin == TRAY_PIN) {
         return s_tray_sw ? 0 : 1;
+    }
+    /* ★ 投放点激光检测（2026-10-09）：与开关不同，"检测到"对应的电平极性是**模块输出级/
+       接线**的属性，仿真无从知道 ⇒ 模型跟随产品的 CFG_LASER_ACTIVE_LEVEL
+       （极性对不对只能上台架用 `laser` 实测，见 sort_config.h 该节）。
+       仿真验的是逻辑：夹空不计数、货没取走能自愈重抓、"读不到货"时屏不涨（绝不虚增） */
+    if (port == (void *)CFG_LASER_GPIO && pin == LASER_PIN) {
+        int detected = laser_detected();
+
+        return (CFG_LASER_ACTIVE_LEVEL == GPIO_PIN_RESET) ? (detected ? 0 : 1)
+                                                          : (detected ? 1 : 0);
     }
     return 0;
 }
@@ -627,7 +735,9 @@ static void motor_step(motor_t *m, int mid, double dt_s)
 }
 
 /* ==================== 抓取 / 放件 ==================== */
-static void try_grab(uint32_t claw_us)
+/* @param claw_us = 本次闭爪的目标值（夹紧档）
+   @param claw_before = 闭爪**前一档**（正常序里 = 该形状的初夹档；缺 HALF 步时 = 全开） */
+static void try_grab(uint32_t claw_us, uint32_t claw_before)
 {
     int best = -1;
     double bd = 1e18;
@@ -648,16 +758,21 @@ static void try_grab(uint32_t claw_us)
         }
     }
     if (best >= 0 && bd <= s_item[best].spec.grab_radius_mm * 2.0) {
-        uint32_t want = expected_close_us(s_item[best].spec.shape);
+        uint32_t want      = expected_close_us(s_item[best].spec.shape);
+        uint32_t want_half = expected_half_us(s_item[best].spec.shape);
 
-        if (claw_us != want) {
+        if ((claw_us != want) || (claw_before != want_half)) {
             /* 夹持方案与物块形状不匹配：角度不对 = 夹不住（滑脱，货留在托盘上）——
-               产品端把形状传错/方案索引搞错在这条路径上立刻现形（场景判 FAIL） */
+               产品端把形状传错/方案索引搞错在这条路径上立刻现形（场景判 FAIL）。
+               **夹紧档与初夹档都比对**：初夹档错、或整个缺掉 HALF 预夹步（OPEN→夹紧
+               直合）同样抓不牢（顶歪物块），一并判失败 */
             g_res.items_empty_grab++;
             if (g_plant.verbose) {
-                printf("  [%6.2fs][抓] #%d 夹持方案与形状不匹配（形状 %u：期望 %u us，实发 %u us）-> 滑脱\n",
+                printf("  [%6.2fs][抓] #%d 夹持方案与形状不匹配（形状 %u：期望 初夹 %u/夹紧 %u us，"
+                       "实发 初夹 %u/夹紧 %u us）-> 滑脱\n",
                        (double)sim_now_us_get() / 1e6, best, s_item[best].spec.shape,
-                       (unsigned)want, (unsigned)claw_us);
+                       (unsigned)want_half, (unsigned)want, (unsigned)claw_before,
+                       (unsigned)claw_us);
             }
             return;
         }
@@ -717,6 +832,7 @@ static void release_item(uint32_t claw_us)
                 s_item[i].state = IT_BIN;
                 s_item[i].bin = sim_current_bin();
                 g_res.items_done++;
+                laser_trigger_pulse(); /* ★ 落料穿过光路 = 一段短脉冲（产品靠它认"真投放"） */
             } else {
                 s_item[i].state = IT_LOST;
                 s_item[i].bin = -1;
@@ -755,7 +871,8 @@ static void servo_poll(void)
         }
         if (claw_is_close_us(cl) && !claw_is_close_us(prev)) {
             if (s_last_lift == US_LIFT_DOWN) {
-                try_grab(cl);
+                /* prev = 闭爪前一档，正常序里就是本件的**初夹**档（缺 HALF 步时 = 全开） */
+                try_grab(cl, prev);
             } else if (s_held >= 0) {
                 g_res.items_empty_grab++;
                 printf("  [%6.2fs][抓] 升降未下伸就闭合且手上有货 -> 货被夹飞风险\n",
@@ -821,6 +938,11 @@ void sim_plant_step_us(uint32_t dt_us)
         uint8_t f[12];
         uint8_t sum = 0;
         int16_t x10 = 0, y10 = 0;
+        /* ★ 数量位（下标 6，2026-10-10 协议新增）= 本帧托盘上物块总数。
+           模型取**真值**（托盘上还剩几件）——产品侧若把数量位接错、或拿错时刻的帧复核，
+           这里立刻表现为"数量差不是 1"，场景当场变红。k230_count_zero = 上位机还没实现
+           数量位（恒填 0）的冻结症状，见 s25 */
+        uint8_t count = (g_sim.k230_count_zero != 0u) ? 0u : (uint8_t)sim_plant_tray_count();
 
         for (int i = 0; i < s_item_n; i++) {
             if (s_item[i].state == IT_TRAY) {
@@ -850,10 +972,10 @@ void sim_plant_step_us(uint32_t dt_us)
             f[3] = s_item[t].spec.category; /* 类别 ID 1~6（原"颜色"字节） */
             f[4] = s_item[t].spec.shape;    /* 形状 1~3（原"形状"字节；2026-10-01 起启用） */
             f[5] = s_item[t].spec.has_qr;
-            f[6] = 0x00u;
         } else {
-            memset(&f[3], 0, 8);
+            memset(&f[3], 0, 6); /* 类别 形状 hasQR 数量（数量随后照填——空盘也要给 0） */
         }
+        f[6] = count; /* ★ 数量位：无目标帧同样要填（空盘的 0 是末件复核与静默窗的凭据） */
         f[7]  = (uint8_t)(x10 & 0xFF);
         f[8]  = (uint8_t)(((uint16_t)x10 >> 8) & 0xFF);
         f[9]  = (uint8_t)(y10 & 0xFF);

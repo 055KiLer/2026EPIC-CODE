@@ -10,6 +10,10 @@
 
 /* 每 100us 由内核调用一次：推进执行器、检测开关边沿、注入串口字节 */
 void sim_plant_step_us(uint32_t dt_us);
+/* ★ 人工再放货（数量复核的补货场景）：**追加**货物到托盘（不动已入盒的件），返回实际添加数 */
+int  sim_plant_add_items(const sim_item_t *items, int n);
+/* 托盘上还剩几件 = 数量位模型的真值（相机该数到的数） */
+int  sim_plant_tray_count(void);
 /* 产品代码从某路串口发出一个字节时调用（电机指令解析 / 屏指令采集） */
 void sim_plant_uart_txd(int uart_id, const uint8_t *data, uint16_t len);
 /* 产品代码读开关引脚 */
@@ -41,6 +45,11 @@ typedef struct
     double   home_x_mm, home_y_mm; /* 上电时机架所在位置（机器不自知） */
     float    drop_x, drop_y;     /* 投放点真实机械坐标 */
     double   vision_err_mm;      /* K230 坐标与实物的偏差 */
+    /* ★ 投放点激光检测（2026-10-09 新硬件；2026-10-10 起产品侧 CFG_LASER_ENABLE=0，
+       激光退出计数闸门）：货在投放点落下、穿过光路时产生的**脉冲宽度**（ms）。
+       台架 `laser drop` 实测 ≈1µs 窄事件 ⇒ 产品侧只有 EXTI 沿抓得住（那一支现未启用）。
+       本参数保留：模型照旧按它发脉冲，`laser_stuck/dead` 注入也照旧有效 */
+    double   laser_pulse_ms;
     /* ---- 视觉标定真值：视觉原点在机械坐标系里的位置 + 两轴符号（见电控文档 §4.1）---- */
     double   vision_origin_x_mm; /* 视觉原点 = 标定中心（托盘上距左边 87.5 / 距底部 82.5 mm） */
     double   vision_origin_y_mm;

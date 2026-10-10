@@ -12,5 +12,8 @@
 #define X_LIMIT_GPIO_Port    GPIOB
 #define Y_LIMIT_Pin          GPIO_PIN_5
 #define Y_LIMIT_GPIO_Port    GPIOC
+/* 投放点激光检测（2026-10-09）：与产品 Core/Inc/main.h 逐字一致（PD14，检测到 = 低） */
+#define LASER_PART_Pin       GPIO_PIN_14
+#define LASER_PART_GPIO_Port GPIOD
 
 #endif

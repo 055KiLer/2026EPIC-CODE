@@ -48,9 +48,16 @@ typedef struct
     uint8_t limit_y_dead;
     uint8_t tray_sw_stuck;
     uint8_t tray_sw_dead;
+    /* --- 投放点激光检测（2026-10-09 新硬件；2026-10-10 起**退出计数闸门**：爪挡光路） ---
+       产品 CFG_LASER_ENABLE=0 时这两项不参与判定；台架 `laser drop`/`laser verify` 是它的
+       验收工具（见 dbg_config.h §3.6），仿真台不再为它建场景 */
+    uint8_t laser_dead;            /* 1 = 永远读不到"检测到"（断线/光路没对准/极性反） */
+    uint8_t laser_stuck;           /* 1 = 永远读作"检测到"（卡住/短接）——夹空会被漏放 */
     /* --- 视觉 --- */
     uint8_t k230_link_down;        /* 1 = K230 不再发帧 */
     uint8_t k230_out_of_envelope;  /* 1 = K230 报告越界坐标 */
+    uint8_t k230_count_zero;       /* ★ 1 = 数量位恒填 0（= 上位机还没实现下标 6）：
+                                      "产品已上数量复核、K230 还没跟"的冻结症状，见 s25 */
     /* --- 几何 --- */
     float   limit_trigger_x_mm;    /* 限位实际触发时的 X（可正可负 = 安装偏差） */
     float   limit_trigger_y_mm;
@@ -137,6 +144,10 @@ extern GPIO_TypeDef sim_GPIOA, sim_GPIOB, sim_GPIOC, sim_GPIOD;
 #define GPIO_PIN_10 ((uint16_t)0x0400)
 #define GPIO_PIN_11 ((uint16_t)0x0800)
 #define GPIO_PIN_12 ((uint16_t)0x1000)
+/* 13~15：2026-10-09 补（激光检测接的是 PD14）——值与 HAL 的 GPIO_PIN_n 定义逐字一致 */
+#define GPIO_PIN_13 ((uint16_t)0x2000)
+#define GPIO_PIN_14 ((uint16_t)0x4000)
+#define GPIO_PIN_15 ((uint16_t)0x8000)
 
 uint32_t HAL_GetTick(void);
 GPIO_PinState HAL_GPIO_ReadPin(GPIO_TypeDef *port, uint16_t pin);
