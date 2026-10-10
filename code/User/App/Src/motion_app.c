@@ -365,7 +365,9 @@ uint8_t Motion_TrayHome(void) {
             vTaskDelay(pdMS_TO_TICKS(50u));
         }
 
-        /* 1) 粗寻标：超时必须覆盖一整圈 */
+        /* 1) 粗撞定位（2026-10-11 "撞—退—再撞"）：480rpm 撞上凸块即停。撞停点会冲过
+           触发点 0.5~1.5°、不完美停在开关上——本相只负责"找到凸块在哪"，可靠零位由
+           相位3 的再撞沿给出；超时必须覆盖一整圈 */
         if (!Zdt_SpeedMode(ZDT_ID_TRAY, (Zdt_DIR_e)CFG_TRAY_DIR_FORWARD, CFG_TRAY_SEEK_RPM,
                            CFG_ZDT_ACCEL)) {
             return 0u;
@@ -377,68 +379,50 @@ uint8_t Motion_TrayHome(void) {
         (void)Zdt_Stop(ZDT_ID_TRAY);
         vTaskDelay(pdMS_TO_TICKS(50u));
 
-        /* 2) 必须反向脱开：旋转轴只有一条沿，继续正转会把它甩到开关身后，
-           慢速再压就得再等一整圈（远超 APPROACH 超时）。
-           ★ 台架实测（2026-10-01）凸块压住开关的弧宽 > 600 脉冲（1.8°）：退一份没脱开
-           就**原地再加退一份**（最多 4 份 = 7.2°），而不是作废整次尝试、害下一轮
-           "退出相+重新粗寻标"多转一整圈。
-           ★ 过冲保护（2026-10-01 二次提速后实机现象）：480rpm 撞停的过冲可能把凸块
-           直接送过开关作用弧——停车点已在开关身后、电平=松开，此时"反向退到松开"会
-           立即**假成功**，慢压相就得从另一侧追将近一整圈（用户看到的"第二圈"）。
-           处置：停车点已松开时**先反向慢转回找窗口**（上限 CFG_TRAY_REENTRY_PULSES，
-           压上即停、再走常规退出）；走满没压上 = 触发是噪声假沿（停车点其实在窗口
-           之前，回找的这一段只是把它再退远一点），直接进慢压相由正向慢压找真正的沿。
-           两条路都不需要降速 */
+        /* 2) 重撞前退离（2026-10-11 "撞—退—再撞"）：反向退 4.8° **走满**——vTaskDelay
+           等走满而不是"电平松开即停"：停止帧打断会让实际退量随机（±打断时刻），重撞
+           起点就不可重复。走满后电平必须=松开（已在凸块前沿之前）；仍压着 = 凸块窗口
+           异常宽/开关粘死，逐份加退兜底（旧实测凸块弧宽 >1.8° 的教训） */
+        if (!Motion_TrayMovePulses(TRAY_DIR_BACK, CFG_TRAY_REHOME_BACKOFF_PULSES,
+                                   CFG_TRAY_APPROACH_RPM)) {
+            return 0u;
+        }
+        vTaskDelay(pdMS_TO_TICKS(Kinematics_TrayMoveTimeMs(CFG_TRAY_REHOME_BACKOFF_PULSES,
+                                                           (float)CFG_TRAY_APPROACH_RPM)));
         {
-            uint8_t cleared      = 0u;
-            uint8_t skip_release = 0u; /* 1 = 假沿/停在窗口前：无窗口可退出 */
+            uint8_t cleared = 0u;
 
-            if (Bsp_Gpio_TrayOrigin() == 0u) { /* 停车就已经是松开 = 不在窗口内 */
-                if (!Motion_TrayMovePulses(TRAY_DIR_BACK, CFG_TRAY_REENTRY_PULSES,
-                                           CFG_TRAY_APPROACH_RPM)) {
-                    return 0u;
-                }
-                if (Motion_WaitTrayLevel(1u, Kinematics_TrayMoveTimeMs(
-                                                 CFG_TRAY_REENTRY_PULSES,
-                                                 (float)CFG_TRAY_APPROACH_RPM)) != 0u) {
-                    (void)Zdt_Stop(ZDT_ID_TRAY); /* 回进窗口：转下面的常规退出 */
-                } else {
-                    (void)Zdt_Stop(ZDT_ID_TRAY);
-                    skip_release = 1u; /* 没找到窗口：停车点在窗口前，别在这里耗 */
-                }
-            }
-            if (skip_release == 0u) {
-                for (uint8_t k = 0u; k < 4u; k++) {
-                    if (!Motion_TrayMovePulses(TRAY_DIR_BACK, CFG_TRAY_BACKOFF_PULSES,
-                                               CFG_TRAY_APPROACH_RPM)) {
-                        return 0u;
-                    }
-                    if (!Motion_WaitTrayLevel(0u, CFG_TRAY_APPROACH_TIMEOUT_MS)) {
-                        (void)Zdt_Stop(ZDT_ID_TRAY);
-                        continue; /* 这一份没退出来，再加退一份 */
-                    }
-                    (void)Zdt_Stop(ZDT_ID_TRAY);
+            for (uint8_t k = 0u; k < 4u; k++) {
+                if (Bsp_Gpio_TrayOrigin() == 0u) { /* 0=松开：已在前沿之前 */
                     cleared = 1u;
                     break;
                 }
-                if (cleared == 0u) {
-                    continue; /* 4 份（7.2°）仍压着：开关粘死/凸块异常，换一次尝试 */
+                if (!Motion_TrayMovePulses(TRAY_DIR_BACK, CFG_TRAY_BACKOFF_PULSES,
+                                           CFG_TRAY_APPROACH_RPM)) {
+                    return 0u;
                 }
+                vTaskDelay(pdMS_TO_TICKS(Kinematics_TrayMoveTimeMs(CFG_TRAY_BACKOFF_PULSES,
+                                                                   (float)CFG_TRAY_APPROACH_RPM)));
+            }
+            if (cleared == 0u) {
+                continue; /* 退满 4.8°+4 份仍压着：开关粘死/凸块异常，换一次尝试 */
             }
         }
 
-        /* ★ 相位2→3 必须留帧间隙（台架 dbg_app.c:1339 同款 50ms，2026-10-01 补）：
-           反向脱开的停止帧和慢压的速度模式帧背靠背（≈1.5ms）会被驱动器丢掉后者，
-           表现 = "撞开关→弹回来（脱开成功）→托盘再也不动"，1.5s 超时作废重试，
-           每次重试都死在同一处——用户看到的"转一圈→撞→弹回→愣住"循环即此 */
+        /* ★ 相位2→3 必须留帧间隙（台架 dbg_app.c 同款 50ms，2026-10-01 纪律：同线相邻
+           帧距 ≥10ms，否则速度帧被丢、再撞相白等一整圈才超时） */
         vTaskDelay(pdMS_TO_TICKS(50u));
 
-        /* 3) 慢速同方向再压：这条沿就是索引零位（与后续定位同方向，背隙已吃进） */
-        if (!Zdt_SpeedMode(ZDT_ID_TRAY, (Zdt_DIR_e)CFG_TRAY_DIR_FORWARD, CFG_TRAY_APPROACH_RPM,
+        /* 3) 再撞定零：正向 480rpm 撞回去，撞上沿 = 索引零位。★ 撞击式触发实测 100%
+           可靠（相位1 从未失手），120rpm 渐压间歇触发不了开关——那是旧方案回零失败的
+           主因，2026-10-11 移除。停车点 = 沿+过冲(±1.5°)，由相位4 对格偏移的标定值
+           吸收平均过冲（重标见 CFG_TRAY_HOME_OFFSET_DEG 注释）；传动状态 = 正向绷紧，
+           与后续定位同向，齿隙不进误差 */
+        if (!Zdt_SpeedMode(ZDT_ID_TRAY, (Zdt_DIR_e)CFG_TRAY_DIR_FORWARD, CFG_TRAY_SEEK_RPM,
                            CFG_ZDT_ACCEL)) {
             return 0u;
         }
-        if (!Motion_WaitTrayLevel(1u, CFG_TRAY_APPROACH_TIMEOUT_MS)) {
+        if (!Motion_WaitTrayLevel(1u, CFG_TRAY_HOME_TIMEOUT_MS)) {
             (void)Zdt_Stop(ZDT_ID_TRAY);
             continue;
         }

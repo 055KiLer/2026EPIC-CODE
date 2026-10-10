@@ -1496,14 +1496,17 @@ static int8_t Dbg_App_TrayWaitLevel(uint8_t want_pressed, uint32_t timeout_ms) {
     return 0;
 }
 
-/* ★ 转盘回零（五相，逐相对齐产品 Motion_TrayHome）：
+/* ★ 转盘回零（四相，逐相对齐产品 Motion_TrayHome；2026-10-11 换代"撞—退—再撞"）：
    相位0 凸块可能正压在开关上：先正转退出窗口（2×backoff），才取得到干净的沿
-   相位1 粗寻标：速度模式正转 SEEK_RPM，等原点压下；超时必须覆盖一整圈（HOME_TIMEOUT=25000ms 名义、按节拍缩放后仍 > 一圈）
-   相位2 反向脱开：位置模式倒转 BACKOFF_PULSES —— 旋转轴只有一条沿，继续正转会把它甩到
-         开关身后，慢速再压就得再等一整圈（远超 APPROACH 超时）
-   相位3 慢压定零：速度模式正转 APPROACH_RPM，压下沿 = 索引零位（与后续定位同向，背隙已吃进）
+   相位1 粗撞定位：速度模式正转 SEEK_RPM，撞上即停——撞停点会冲过触发点 0.5~1.5°、
+         不完美停在开关上，本相只负责"找到凸块在哪"；超时必须覆盖一整圈
+   相位2 重撞前退离：位置模式反向退 REHOME_BACKOFF（4.8°）**走满** + 电平松开确认，
+         回到凸块前沿之前（退量确定，重撞起点才可重复）
+   相位3 再撞定零：速度模式正转 SEEK_RPM 再撞一次，撞上沿 = 索引零位（撞击式触发
+         实测 100% 可靠；旧 120rpm 慢压渐压间歇触发不了开关 = 回零失败主因，连同
+         过冲回找/假沿 skip 整套删除——撞停点实测始终在凸块窗口内，回找从未触发）
    两次尝试（产品同款）；途中敲任意键 = 软急停（记账作废）。
-   ★ 顺带验证原点开关校准：五相全程走通 = PB0 电平/极性/位置都对 */
+   ★ 顺带验证原点开关校准：四相全程走通 = PB0 电平/极性/位置都对 */
 uint8_t Dbg_App_TrayHome(uint16_t seek_rpm) {
     int8_t r;
 
@@ -1518,8 +1521,8 @@ uint8_t Dbg_App_TrayHome(uint16_t seek_rpm) {
 
     s_tray_trusted = 0u;
 
-    Dbg_Printf("[THOME] 转盘回零（五相）：凸块退出 → 粗寻标@%urpm → 反向脱开 → 慢压@%durpm 定零（实际值 = 名义×%u%%）\n",
-               (unsigned)Dbg_App_TrayRpm(seek_rpm), (unsigned)Dbg_App_TrayRpm(CFG_TRAY_APPROACH_RPM),
+    Dbg_Printf("[THOME] 转盘回零（四相·撞—退—再撞）：凸块退出 → 粗撞@%urpm → 反向退走满 → 再撞@%urpm 定零（实际值 = 名义×%u%%）\n",
+               (unsigned)Dbg_App_TrayRpm(seek_rpm), (unsigned)Dbg_App_TrayRpm(seek_rpm),
                (unsigned)s_tray_speed_pct);
     Dbg_Printf("[THOME] 原点开关 PB0（`lim` 可看电平）；手放电源开关上；途中敲任意键=软急停\n");
 
@@ -1548,8 +1551,8 @@ uint8_t Dbg_App_TrayHome(uint16_t seek_rpm) {
             }
         }
 
-        /* ---- 相位 1：粗寻标（速度模式） ---- */
-        Dbg_Printf("[THOME] 尝试%u 相位1：粗寻标@%urpm（超时 %ums 覆盖一整圈）\n", (unsigned)attempt,
+        /* ---- 相位 1：粗撞定位（速度模式） ---- */
+        Dbg_Printf("[THOME] 尝试%u 相位1：粗撞@%urpm（超时 %ums 覆盖一整圈）\n", (unsigned)attempt,
                    (unsigned)Dbg_App_TrayRpm(seek_rpm), (unsigned)Dbg_App_TrayTimeout(CFG_TRAY_HOME_TIMEOUT_MS));
         if (Zdt_Bus_SpeedOn((uint8_t)DBG_MOTOR_TRAY, Zdt_Bus_AddrOf(DBG_MOTOR_TRAY),
                             DBG_TRAY_DIR_FWD, Dbg_App_TraySpeedField(Dbg_App_TrayRpm(seek_rpm)),
@@ -1571,94 +1574,78 @@ uint8_t Dbg_App_TrayHome(uint16_t seek_rpm) {
         }
         Dbg_App_WaitMs(50);
 
-        /* ---- 相位 2：反向脱开（自动加退 + 过冲回找，2026-10-01）----
-         ★ 台架实测：凸块压住开关的弧宽 > 600 脉冲（1.8°）——退一份退不出来 = 开关一直
-           压着 → 本轮作废 → 下轮"凸块退出"相正向 3.6° 退出来再找一圈 = 用户看到的
-           "碰按钮后又多转一圈"。修法 = 退一份没脱开就**原地再退一份**（最多 4 份 =
-           7.2°），而不是烧掉整次尝试重来
-         ★ 过冲回找（二次提速后实机现象）：480rpm 撞停的过冲可能把凸块直接送过开关
-           作用弧——停车点已在开关身后、电平=松开，"反向退到松开"会立即**假成功**，
-           慢压相就得从另一侧追将近一整圈（"白转一圈"）。处置：停车点已松开时先反向
-           慢转 DBG_CFG_TRAY_REENTRY_PULSES 回找窗口，压上即停再走常规退出；走满没压
-           上 = 假沿（停车点在窗口前），直接进慢压相。两条路都不用降速 */
+        /* ---- 相位 2：重撞前退离（2026-10-11 "撞—退—再撞"，与产品同款）----
+         ★ 撞停点会冲过触发点 0.5~1.5°、不会完美停在开关上——本相反向退 4.8° **走满**
+           回到凸块前沿之前。走满 = WaitMsStop 等 Kinematics 估时（不再"电平松开即停"）：
+           停止帧打断会让实际退量随机，重撞起点就不可重复
+         ★ 走满后电平必须=松开（台架口径 1=松开）；仍压着 = 凸块窗口异常宽/开关粘死，
+           逐份加退兜底（旧实测凸块弧宽 >1.8° 的教训），最多 4 份 */
         {
-            uint8_t cleared      = 0u;
-            uint8_t skip_release = 0u;
+            uint8_t cleared = 0u;
 
-            if (Dbg_Gpio_Level(DBG_LIMIT_TRAY) != 0u) { /* 台架口径 1=松开/0=压下（勿照抄产品的 1=压下）：已松开 = 停车点不在窗口内 */
-                Dbg_Printf("[THOME] 相位2：停车点已是松开（过冲出窗口/假沿）——反向回找窗口 ≤%u 脉冲\n",
-                           (unsigned)DBG_CFG_TRAY_REENTRY_PULSES);
-                if (Dbg_App_TrayMovePulses(DBG_TRAY_DIR_BACK, DBG_CFG_TRAY_REENTRY_PULSES,
-                                           (uint16_t)CFG_TRAY_APPROACH_RPM) == 0u) {
-                    Dbg_Printf("[FAIL] 回找帧没发出去\n");
-                    return 0u;
-                }
-                r = Dbg_App_TrayWaitLevel(1u, Dbg_App_TrayWaitOf(Kinematics_TrayMoveTimeMs(
-                                                  DBG_CFG_TRAY_REENTRY_PULSES,
-                                                  (float)CFG_TRAY_APPROACH_RPM)));
+            Dbg_Printf("[THOME] 相位2：反向退 %u 脉冲@%urpm 走满（重撞前退离）\n",
+                       (unsigned)CFG_TRAY_REHOME_BACKOFF_PULSES,
+                       (unsigned)Dbg_App_TrayRpm(CFG_TRAY_APPROACH_RPM));
+            if (Dbg_App_TrayMovePulses(DBG_TRAY_DIR_BACK, CFG_TRAY_REHOME_BACKOFF_PULSES,
+                                       (uint16_t)CFG_TRAY_APPROACH_RPM) == 0u) {
+                Dbg_Printf("[FAIL] 退离帧没发出去\n");
+                return 0u;
+            }
+            if (Dbg_App_WaitMsStop(Dbg_App_TrayWaitOf(Kinematics_TrayMoveTimeMs(
+                    CFG_TRAY_REHOME_BACKOFF_PULSES, (float)CFG_TRAY_APPROACH_RPM))) != 0u) {
                 (void)Zdt_Bus_StopMotor(DBG_MOTOR_TRAY);
-                if (r < 0) {
-                    Dbg_Printf("[THOME] 软急停（相位2 回找）\n");
+                Dbg_Printf("[WARN] 软急停（相位2）——退离没走完，重新 thome\n");
+                return 0u;
+            }
+            for (uint8_t k = 1u; k <= 4u; k++) {
+                if (Dbg_Gpio_Level(DBG_LIMIT_TRAY) != 0u) { /* 1=松开：已在凸块前沿之前 */
+                    cleared = 1u;
+                    break;
+                }
+                Dbg_Printf("[THOME]   退满仍压着，加退一份（第 %u 份）\n", (unsigned)k);
+                if (Dbg_App_TrayMovePulses(DBG_TRAY_DIR_BACK, CFG_TRAY_BACKOFF_PULSES,
+                                           (uint16_t)CFG_TRAY_APPROACH_RPM) == 0u) {
+                    Dbg_Printf("[FAIL] 加退帧没发出去\n");
                     return 0u;
                 }
-                if (r == 0) {
-                    Dbg_Printf("[THOME] 相位2：回找没压上（假沿，停车点在窗口前）——直接进慢压相\n");
-                    skip_release = 1u;
-                } else {
-                    Dbg_Printf("[THOME] 相位2：回进窗口（过冲已确认），按常规反向退出\n");
+                if (Dbg_App_WaitMsStop(Dbg_App_TrayWaitOf(Kinematics_TrayMoveTimeMs(
+                        CFG_TRAY_BACKOFF_PULSES, (float)CFG_TRAY_APPROACH_RPM))) != 0u) {
+                    (void)Zdt_Bus_StopMotor(DBG_MOTOR_TRAY);
+                    Dbg_Printf("[WARN] 软急停（相位2 加退）\n");
+                    return 0u;
                 }
             }
-            if (skip_release == 0u) {
-                Dbg_Printf("[THOME] 相位2：反向脱开 %u 脉冲@%durpm（没脱开自动加退，最多 4 份）\n",
-                           (unsigned)CFG_TRAY_BACKOFF_PULSES,
-                           (unsigned)Dbg_App_TrayRpm(CFG_TRAY_APPROACH_RPM));
-                for (uint8_t k = 1u; k <= 4u; k++) {
-                    if (Dbg_App_TrayMovePulses(DBG_TRAY_DIR_BACK, CFG_TRAY_BACKOFF_PULSES,
-                                               (uint16_t)CFG_TRAY_APPROACH_RPM) == 0u) {
-                        Dbg_Printf("[FAIL] 脱开帧没发出去\n");
-                        return 0u;
-                    }
-                    r = Dbg_App_TrayWaitLevel(0u, Dbg_App_TrayTimeout(CFG_TRAY_APPROACH_TIMEOUT_MS));
-                    (void)Zdt_Bus_StopMotor(DBG_MOTOR_TRAY);
-                    if (r < 0) {
-                        Dbg_Printf("[THOME] 软急停（相位2）\n");
-                        return 0u;
-                    }
-                    if (r == 1) {
-                        cleared = 1u;
-                        break;
-                    }
-                    Dbg_Printf("[THOME]   退了 %u 份（%u 脉冲）仍压着，再加退一份\n", (unsigned)k,
-                               (unsigned)(k * CFG_TRAY_BACKOFF_PULSES));
-                }
-                if (cleared == 0u) {
-                    Dbg_Printf("[THOME] 相位2 退满 4×%u 脉冲（=7.2°）仍未脱开——开关粘死或凸块"
-                               "作用宽度异常，`lim` 看电平，查机械后重试\n",
-                               (unsigned)CFG_TRAY_BACKOFF_PULSES);
-                    continue;
-                }
+            if (cleared == 0u) {
+                Dbg_Printf("[THOME] 相位2 退满 %u+4×%u 脉冲仍未脱开——开关粘死或凸块异常，"
+                           "`lim` 看电平，查机械后重试\n",
+                           (unsigned)CFG_TRAY_REHOME_BACKOFF_PULSES,
+                           (unsigned)CFG_TRAY_BACKOFF_PULSES);
+                continue;
             }
         }
         Dbg_App_WaitMs(50);
 
-        /* ---- 相位 3：慢压定零（速度模式，压下沿 = 索引零位） ---- */
-        Dbg_Printf("[THOME] 相位3：慢压@%durpm，压下沿 = 零位\n",
-                   (unsigned)Dbg_App_TrayRpm(CFG_TRAY_APPROACH_RPM));
+        /* ---- 相位 3：再撞定零（2026-10-11）：正向 480rpm 撞回去，撞上沿 = 索引零位 ----
+         ★ 撞击式触发实测 100% 可靠（相位1 从未失手）；旧 120rpm 慢压渐压间歇触发不了
+           开关 = 回零失败主因，已删。停车点 = 沿+过冲(±1.5°)，相位4 偏移标定值吸收
+           平均过冲（10° 需重标）；正向撞 = 传动绷紧，与后续定位同向，齿隙不进误差 */
+        Dbg_Printf("[THOME] 相位3：正向再撞@%urpm，撞上沿 = 零位（超时 %ums）\n",
+                   (unsigned)Dbg_App_TrayRpm(seek_rpm),
+                   (unsigned)Dbg_App_TrayTimeout(CFG_TRAY_HOME_TIMEOUT_MS));
         if (Zdt_Bus_SpeedOn((uint8_t)DBG_MOTOR_TRAY, Zdt_Bus_AddrOf(DBG_MOTOR_TRAY),
-                            DBG_TRAY_DIR_FWD,
-                            Dbg_App_TraySpeedField(Dbg_App_TrayRpm((uint16_t)CFG_TRAY_APPROACH_RPM)),
+                            DBG_TRAY_DIR_FWD, Dbg_App_TraySpeedField(Dbg_App_TrayRpm(seek_rpm)),
                             DBG_APP_ACCEL) == 0u) {
             Dbg_Printf("[FAIL] 速度模式帧没发出去\n");
             return 0u;
         }
-        r = Dbg_App_TrayWaitLevel(1u, Dbg_App_TrayTimeout(CFG_TRAY_APPROACH_TIMEOUT_MS));
+        r = Dbg_App_TrayWaitLevel(1u, Dbg_App_TrayTimeout(CFG_TRAY_HOME_TIMEOUT_MS));
         (void)Zdt_Bus_StopMotor(DBG_MOTOR_TRAY);
         if (r < 0) {
             Dbg_Printf("[THOME] 软急停（相位3）\n");
             return 0u;
         }
         if (r == 0) {
-            Dbg_Printf("[THOME] 相位3 超时未压下——粗压那次可能是假沿，重试\n");
+            Dbg_Printf("[THOME] 相位3 超时未撞上——相位2 退离不够/凸块异常，重试\n");
             continue;
         }
         Dbg_App_WaitMs(50);
@@ -1667,6 +1654,8 @@ uint8_t Dbg_App_TrayHome(uint16_t seek_rpm) {
          凸块索引零位与格中心差 DBG_CFG_TRAY_HOME_OFFSET_DEG（现值 10°，宏在 dbg_config.h；
          首版 15° 实测偏多已废）：零位定在索引沿后，
          **再正向转这么多度**才是盒1 正对投放位——与 XY"归零后退 3mm 驻留"同一思路。
+         ★ 2026-10-11 改"再撞定零"后**必须重标**：零位停车点 = 再撞沿+过冲（±1.5°），
+           比旧慢压沿过冲大——用 `tb` 对格实测修正。
          ★ 脉冲记账的原点仍 = 索引沿（s_tray_pulses 从偏移量起算）：索引沿复核
            （TrayIndexCrossings 按 PER_REV 分界）与盒号折算（TrayBinOf(5000)=0）都保持正确。
          ★ 附带好处：驻留位在开关外，转盘平时**不压着原点开关**（无磨损、无沿计数噪声） */
@@ -1723,7 +1712,7 @@ void Dbg_App_TrayPrint(void) {
                (unsigned)CFG_TRAY_BELT_TEETH_GEAR, (unsigned)CFG_TRAY_BELT_TEETH_MOTOR,
                (unsigned)CFG_TRAY_GEAR_RATIO, (unsigned)CFG_TRAY_BINS,
                (unsigned)DBG_TRAY_DIR_FWD);
-    Dbg_Printf("[TRAY] 速度系数 %u（`tspu`）节拍 %u%%（`tspd`）；粗寻标/对格/慢压 = %u/%u/%u rpm@电机轴\n",
+    Dbg_Printf("[TRAY] 速度系数 %u（`tspu`）节拍 %u%%（`tspd`）；粗撞/对格/退离 = %u/%u/%u rpm@电机轴\n",
                (unsigned)s_tray_scale, (unsigned)s_tray_speed_pct,
                (unsigned)((uint32_t)CFG_TRAY_SEEK_RPM * s_tray_speed_pct / 100u),
                (unsigned)((uint32_t)CFG_TRAY_SPEED_RPM * s_tray_speed_pct / 100u),
@@ -1783,7 +1772,7 @@ uint8_t Dbg_App_TrayGotoBin(uint8_t bin) {
 
     pulses = (uint32_t)((delta > 0) ? delta : -delta) * (uint32_t)CFG_TRAY_PULSES_PER_BIN;
     est_ms = Kinematics_TrayMoveTimeMs(pulses, (float)CFG_TRAY_SPEED_RPM);
-    Dbg_Printf("[INFO] 转到盒%u：%s %d 格 = %u 电机脉冲 @%durpm（实际）%u ms 估算"
+    Dbg_Printf("[INFO] 转到盒%u：%s %d 格 = %u 电机脉冲 @%urpm（实际）%u ms 估算"
                "（名义口径，等待已按节拍缩放）\n",
                (unsigned)(bin + 1u), (delta > 0) ? "正转" : "反转", (int)delta, (unsigned)pulses,
                (unsigned)Dbg_App_TrayRpm(CFG_TRAY_SPEED_RPM), (unsigned)est_ms);
