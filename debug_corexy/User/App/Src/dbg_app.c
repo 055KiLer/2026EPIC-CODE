@@ -800,6 +800,208 @@ static void Dbg_App_LimitWatch(void) {
     }
 }
 
+/* ---------- 投放点激光检测（2026-10-09；引脚/极性/参数见 dbg_config.h §3.6） ---------- */
+
+/* µs 计时的"每 µs 多少 CPU 周期"：**用 HAL_GetTick 现场自校准**，不读全局 SystemCoreClock。
+   台架实测吃过亏：首版用 SystemCoreClock/1e6 当除数，实测打印"宽 0 µs"——那个全局量的
+   更新依赖 HAL 版本/调用路径，一不可信就表现为"宽度恒 0"，比不显示更误导。
+   自校准用 1ms tick 当尺子（5ms 窗口，命令级可接受），量出来 ≈168 @168MHz */
+static uint32_t s_us_div;
+
+static uint8_t Dbg_App_DwtCalibrate(void) {
+    uint32_t t0, t1, c0, c1, dtick, dcyc;
+
+    CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+    DWT->CYCCNT = 0u;
+    DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
+
+    t0 = HAL_GetTick();
+    c0 = DWT->CYCCNT;
+    while ((HAL_GetTick() - t0) < 5u) {
+    }
+    t1 = HAL_GetTick();
+    c1 = DWT->CYCCNT;
+
+    dtick    = t1 - t0;
+    dcyc     = c1 - c0;
+    s_us_div = 0u;
+    if ((dtick != 0u) && (dcyc != 0u)) {
+        s_us_div = dcyc / (dtick * 1000u);
+    }
+    return (s_us_div != 0u) ? 1u : 0u;
+}
+
+static uint32_t Dbg_App_Micros(void) {
+    return (s_us_div != 0u) ? (uint32_t)(DWT->CYCCNT / s_us_div) : 0u;
+}
+
+/* ★ 落料事件捕获（`laser drop [秒]`）：µs 级快采样，把光路上的每一段"检测到"都量下来
+   （段数 + 每段**周期数/µs**）。**本命令就是为用户那句"物块落下的时间很短"写的**
+   （2026-10-09 上机实测：一次落料 ≈ **1 个采样点宽（µs 级）**，且没有毛刺干扰）。
+   结论怎么用：**段数**才是判据的输入（判据 = "窗口内捕到一次检测"，产品侧用 EXTI 沿）；
+   宽度只用于回答"这信号能不能靠电平轮询抓" —— 宽度 ≈0 µs/一个采样点 ⇒ **不能**，必须沿。
+   用法两种都行：① 手动：从投放点上方松手丢一块货，让它穿过光路；
+                 ② 从爪里：`pick <物块X Y>` 抓起来别松爪 → `drop` → `laser drop`
+   裸忙等采样（本工程无 RTOS）；每 1ms 边界照看一次限位与软急停，任意键中止。
+   ⚠️ 本函数只用整数打印——自带格式器不支持 %f（踩过：`%.1f` 打出来是 "?1f"） */
+void Dbg_App_LaserCapture(uint32_t secs) {
+    uint32_t t_end = HAL_GetTick() + secs * 1000u;
+    uint32_t guard = HAL_GetTick();
+    uint32_t n     = 0u;
+    uint8_t  in    = 0u;
+    uint32_t start_cyc = 0u;
+    uint8_t  dwt_ok = Dbg_App_DwtCalibrate();
+
+    Dbg_Printf("[LASER] 捕获 %us（%s，µs 级采样；宽度计时 %s，1µs≈%u 周期）：此刻 = %s\n",
+               (unsigned)secs, DBG_CFG_LASER_NAME,
+               (dwt_ok != 0u) ? "DWT 可用" : "**DWT 不可用**（只报段数）", (unsigned)s_us_div,
+               (Dbg_Gpio_LaserPart() != 0u) ? "检测中" : "无检测");
+    Dbg_Printf("[LASER] 现在把货从光路上放过去（手动丢 / `pick` 别松爪再跑本命令）……\n");
+
+    while ((int32_t)(HAL_GetTick() - t_end) < 0) {
+        if (Dbg_Gpio_LaserPart() != 0u) {
+            if (in == 0u) {
+                in        = 1u;
+                start_cyc = DWT->CYCCNT;
+            }
+        } else if (in != 0u) {
+            uint32_t cyc = DWT->CYCCNT - start_cyc;
+            uint32_t us  = (s_us_div != 0u) ? (cyc / s_us_div) : 0u;
+
+            in = 0u;
+            n++;
+            Dbg_Printf("[LASER] 事件 #%u：宽 %u 周期（%u µs）%s\n", (unsigned)n, (unsigned)cyc,
+                       (unsigned)us,
+                       (us == 0u) ? "  ← 极窄：等于一个采样点，电平轮询抓不到（要靠 EXTI 沿）"
+                                  : "");
+        }
+        if (HAL_GetTick() != guard) { /* 每 1ms 边界照看一次：限位 + 软急停 */
+            guard = HAL_GetTick();
+            Dbg_App_LimitWatch();
+            if (Dbg_Uart_Available() > 0u) {
+                Dbg_Printf("[LASER] 收到控制台字节 —— 中止捕获（已量到 %u 段）\n", (unsigned)n);
+                return;
+            }
+        }
+    }
+    if (in != 0u) { /* 窗口结束时还在检测中：报下限 */
+        Dbg_Printf("[LASER] 窗口结束时**仍在检测中**（≥%u 周期）—— 光路一直被挡着？\n",
+                   (unsigned)(DWT->CYCCNT - start_cyc));
+        n++;
+    }
+    Dbg_Printf("[OK] 捕获结束：%u 段事件（**一次落料 = 1 段**）。0 段 = 光路上什么都没过"
+               "（没丢货 / 没对准 / 模块没工作 / 线接错）\n",
+               (unsigned)n);
+    if (n != 0u) {
+        Dbg_Printf("[LASER] 判据只认\"窗口内有没有捕到\"（产品侧 = EXTI 下降沿，见 §3.6）——\n"
+                   "        宽度 ≥ 几 ms 时电平轮询也抓得住；若是上面标的\"极窄\"，就只有沿靠得住\n");
+    }
+}
+
+/* ★ 投放点落料复核（`laser verify`）：**激光模块自身的验收工具**。
+   ★ 2026-10-10 起产品不用它当成功判据了（爪下伸到投放点把光路挡死 ⇒ 判据换成视觉
+   "两帧数量差 1"，见产品 sort_config.h 的"数量复核"一节）：本命令现在回答的是
+   "这个模块 + 这个安装位置还能不能看见落料"——哪天把它挪到爪够不着的位置，先在这里验通，
+   再把产品 CFG_LASER_ENABLE 改回 1。
+   序列：静置 → 松爪前先看一眼电平 → **开爪落料** → 窗口内 µs 级密采样 ⇒ 判"捕到检测 / 夹空"。
+   ⚠️ 本命令**会真的松爪**（爪里的货会落到投放点下方）；只想看信号而不动爪，用 `laser drop`。
+   用法：`pick <物块X Y>` 抓起来别松爪 → `drop` 到投放点 → `laser verify`
+   @retval 1 = 捕到检测  0 = 夹空（或期间被控制台字节打断） */
+uint8_t Dbg_App_LaserVerifyDrop(void) {
+    uint32_t t0;
+    uint32_t guard;
+    uint8_t  seen;
+    uint32_t t_first = 0u;
+
+    (void)Dbg_App_DwtCalibrate(); /* 只是让 s_us_div 就绪（本函数不用 µs，留着以后打印用） */
+
+    Dbg_Printf("[LASER] 复核开始（%s）：静置 %ums → 开爪落料 → %ums 窗口内密采样找检测\n",
+               DBG_CFG_LASER_NAME, (unsigned)DBG_CFG_LASER_SETTLE_MS,
+               (unsigned)DBG_CFG_LASER_WAIT_MS);
+    if (Dbg_App_WaitMsStop(DBG_CFG_LASER_SETTLE_MS) != 0u) {
+        Dbg_Printf("[LASER] 静置期间收到控制台字节 —— 中止（未判定）\n");
+        return 0u;
+    }
+
+    seen = (Dbg_Gpio_LaserPart() != 0u) ? 1u : 0u; /* 松爪前先看一眼（稳态电平型模块算证据） */
+    if (seen != 0u) {
+        Dbg_Printf("[LASER] 松爪前电平即\"检测到\"（光路看到爪里的货；按产品口径这已是证据）\n");
+    }
+
+    Dbg_Printf("[LASER] 松爪：夹爪 -> 全开 %u us（货落下，随后找那一下窄事件）\n",
+               (unsigned)DBG_CFG_CLAW_OPEN_US);
+    (void)Servo_Out_SetUs(DBG_SERVO_CLAW, DBG_CFG_CLAW_OPEN_US);
+
+    /* 窗口内**裸忙等密采样**（µs 级；与 `laser drop` 同款）：窄事件必须靠这个才捕得到。
+       每 1ms 边界照看一次限位与软急停；捕到第一段即退出 */
+    t0    = HAL_GetTick();
+    guard = t0;
+    while ((seen == 0u) && ((HAL_GetTick() - t0) < DBG_CFG_LASER_WAIT_MS)) {
+        if (Dbg_Gpio_LaserPart() != 0u) {
+            seen    = 1u;
+            t_first = HAL_GetTick();
+            break;
+        }
+        if (HAL_GetTick() != guard) {
+            guard = HAL_GetTick();
+            Dbg_App_LimitWatch();
+            if (Dbg_Uart_Available() > 0u) {
+                Dbg_Printf("[LASER] 采样期间收到控制台字节 —— 中止（未判定）\n");
+                return 0u;
+            }
+        }
+    }
+    /* 与产品一致：捕到会提前退出，这里把舵机行程时间补足 */
+    if ((HAL_GetTick() - t0) < (uint32_t)DBG_CFG_SERVO_SETTLE_MS) {
+        Dbg_App_WaitMs((uint32_t)DBG_CFG_SERVO_SETTLE_MS - (uint32_t)(HAL_GetTick() - t0));
+    }
+
+    if (seen != 0u) {
+        Dbg_Printf("[OK] 判定：**捕到检测**（松爪后 %ums 内）—— 这个模块在这条安装位置看得见落料\n",
+                   (unsigned)(t_first - t0));
+        return 1u;
+    }
+    Dbg_Printf("[WARN] 判定：**没看见落料**（%ums 窗口内光路上什么都没过）—— 爪里明明有货却没看见 ⇒\n",
+               (unsigned)DBG_CFG_LASER_WAIT_MS);
+    Dbg_Printf("[WARN] 爪里明明有货 ⇒ 按序查：①`laser drop` 看段数（0 段 = 光路/模块/接线）"
+               "②`laser` 看**原始电平**（判定反了改 §3.6 的极性宏）③光路对准 ④模块供电/共地 "
+               "⑤输出类型（NPN 集电极开路才是\"导通=低\"）\n");
+    return 0u;
+}
+
+/* ★ 激光实时观察（`laser watch [秒]`）：电平**变化**才打一行（5ms 采样）——对光/查静态遮挡用：
+   用手挡一下光路，行数该跟着变。⚠️ **短脉冲量不到**（5ms 采样会漏），
+   要量落料脉冲用 `laser drop`。期间限位与软急停照常盯（走 WaitMsStop）。任意键中止 */
+void Dbg_App_LaserWatch(uint32_t secs) {
+    uint32_t t0    = HAL_GetTick();
+    uint32_t dur   = secs * 1000u;
+    uint8_t  last  = Dbg_Gpio_LaserPart();
+    uint32_t flips = 0u;
+
+    Dbg_Printf("[LASER] 观察 %us（%s，每 %ums 采一次，只在变化时打印）：此刻 = %s（原始电平 %u）\n",
+               (unsigned)secs, DBG_CFG_LASER_NAME, (unsigned)DBG_CFG_LASER_POLL_MS,
+               (last != 0u) ? "检测中" : "无检测", (unsigned)Dbg_Gpio_LaserRaw());
+    Dbg_Printf("[LASER] ⚠️ 短脉冲（落料那一下）本命令量不到——用 `laser drop`；本命令看的是"
+               "对准/静态遮挡\n");
+    while ((HAL_GetTick() - t0) < dur) {
+        uint8_t now_lv = Dbg_Gpio_LaserPart();
+
+        if (now_lv != last) {
+            flips++;
+            last = now_lv;
+            Dbg_Printf("[LASER] t=%ums -> %s（原始电平 %u）\n", (unsigned)(HAL_GetTick() - t0),
+                       (now_lv != 0u) ? "检测中" : "无检测", (unsigned)Dbg_Gpio_LaserRaw());
+        }
+        if (Dbg_App_WaitMsStop(DBG_CFG_LASER_POLL_MS) != 0u) {
+            Dbg_Printf("[LASER] 收到控制台字节 —— 中止观察\n");
+            return;
+        }
+    }
+    Dbg_Printf("[OK] 观察结束：%us 内电平变化 %u 次。0 次 = 全程没动过（光路一直挡着/一直空着，"
+               "或模块根本没工作）——用手挡一下光路该有 2 次以上\n",
+               (unsigned)secs, (unsigned)flips);
+}
+
 /* ★ 停止帧台架实测：广播走 10mm@3mm/s，600ms 后（电机正在走）发停止序列。
    每帧应答判决现场打印——电机停没停 + 哪帧什么应答，一次实验定案：
    02 且停了 = 停止帧好使（此前失败=背靠背丢帧/堵转保护）；
@@ -1233,8 +1435,8 @@ static int32_t Dbg_App_TraySigned(uint32_t pulses, uint8_t dir_byte) {
 
 /* 转盘按电机轴口径相对走 pulses 个脉冲（dir_byte = 产品标定的方向字节）。
    ★ 速度字段走转盘自己的系数（tspu），与 XY 的 spu 独立 */
-/* 名义转速 -> 实际下发名义转速（乘百分比，上限 600 = 二次提速后寻标 480 要过得去；
-   旧 300 会把 480 静默砍到 300——与产品 Zdt_SpeedField 上限 600 同口径） */
+/* 名义转速 -> 实际下发名义转速（乘百分比，上限 600 = 产品 Zdt_SpeedField 的同值上限；
+   默认百分比 100 ⇒ 逐相与产品同速：寻标 480 / 对格 240 / 慢压 120 = 产品 CFG_TRAY_*_RPM） */
 static uint16_t Dbg_App_TrayRpm(uint16_t nominal) {
     uint32_t v = (uint32_t)nominal * (uint32_t)s_tray_speed_pct / 100u;
 
@@ -1308,9 +1510,11 @@ uint8_t Dbg_App_TrayHome(uint16_t seek_rpm) {
     if (seek_rpm == 0u) {
         seek_rpm = (uint16_t)CFG_TRAY_SEEK_RPM;
     }
-    if (seek_rpm > 300u) {
-        seek_rpm = 300u;
-    }
+    /* ★ 2026-10-10 删掉旧的"seek_rpm ≤ 300"钳位：产品寻标就是 CFG_TRAY_SEEK_RPM = 480，
+       这里钳到 300 ⇒ 台架回零比产品慢一大截（整圈 7.5s vs 4.7s）、过冲量也不一样
+       ⇒ 台架上校出来的东西不可迁移（用户现场："载物盘太慢，无法像工程代码正确校准"）。
+       上限统一交给 Dbg_App_TrayRpm 的 600（= 产品 ZDT_SPEED_FIELD_MAX 同口径），
+       手滑给个超大值也只会到 600 */
 
     s_tray_trusted = 0u;
 
@@ -1716,6 +1920,46 @@ void Dbg_App_PrintPosition(void) {
                (int)DBG_CFG_XY_Y_MIN_MM, (int)DBG_CFG_XY_MAX_MM);
 }
 
+/* ★ 产品同款目标钳位（2026-10-10 从 Dbg_App_Goto / read 的两份副本里收出来）：
+   规则与产品 Code/Config + sort_config.h 的"够得着就去夹"那一套**逐条同序**，常量全部由
+   dbg_config.h 引用产品值（台架与产品不会各说各话）：
+     ① X < -X 延伸带（-160）            ⇒ 拒绝（连延伸也够不着）
+     ② Y < 工作区下限（-187 = 投放点）   ⇒ 拒绝（-Y 端是机械极限，无延伸量）
+     ③ X/Y > 上限 + 极限位夹取带（25mm） ⇒ 拒绝
+     ④ 落在 [延伸带, X_MIN) 或 (上限, 上限+带] ⇒ **钳到 X_MIN / 上限** 照样伸爪
+     ⑤ 钳完按保护边距（3mm，2026-10-10 5→3 = 产品同值）回拉：> 上限-3mm ⇒ 到 上限-3mm（永不朝回零开关顶满）
+   只判定与钳位、**不打印**（`p`/`pick` 走 Dbg_App_Goto、`read` 只预演，两处打印口径不同）。
+   @param x,y 进出参（就地钳位）  @retval 1 = 可用  0 = 超出产品可达范围（产品会整件作废） */
+static uint8_t Dbg_App_ProdClamp(float *x, float *y) {
+    float cx = *x;
+    float cy = *y;
+
+    if ((cx < DBG_CFG_PROD_X_CLAMP_MM) || (cy < DBG_CFG_PROD_WORK_Y_MIN) ||
+        (cx > (DBG_CFG_PROD_WORK_X_MAX + DBG_CFG_PROD_CLAMP_BAND_MM)) ||
+        (cy > (DBG_CFG_PROD_WORK_Y_MAX + DBG_CFG_PROD_CLAMP_BAND_MM))) {
+        return 0u;
+    }
+    if (cx < DBG_CFG_PROD_WORK_X_MIN) {
+        cx = DBG_CFG_PROD_WORK_X_MIN; /* -X 夹爪延伸带内：钳到软限位就近夹 */
+    }
+    if (cx > DBG_CFG_PROD_WORK_X_MAX) {
+        cx = DBG_CFG_PROD_WORK_X_MAX; /* +X 极限位夹取带内：钳到上限照样伸爪 */
+    }
+    if (cy > DBG_CFG_PROD_WORK_Y_MAX) {
+        cy = DBG_CFG_PROD_WORK_Y_MAX;
+    }
+    if (cx > (DBG_CFG_PROD_WORK_X_MAX - DBG_CFG_PROD_WORK_EDGE_MARGIN)) {
+        cx = DBG_CFG_PROD_WORK_X_MAX - DBG_CFG_PROD_WORK_EDGE_MARGIN;
+    }
+    if (cy > (DBG_CFG_PROD_WORK_Y_MAX - DBG_CFG_PROD_WORK_EDGE_MARGIN)) {
+        cy = DBG_CFG_PROD_WORK_Y_MAX - DBG_CFG_PROD_WORK_EDGE_MARGIN;
+    }
+
+    *x = cx;
+    *y = cy;
+    return 1u;
+}
+
 /* ★ 绝对定位：走到工作区坐标 (x, y)（第三象限，负数）。
    前提 = 两轴都归过零且中途没停过/没撞过（记账可信）。工作区：X ∈ [-135, 0]、Y ∈ [-187, 0]；
    投放点 Y = -187（2026-10-01 口径）。
@@ -1726,7 +1970,7 @@ void Dbg_App_PrintPosition(void) {
      ① X ∈ [-160, -135) ⇒ 钳到 -135（夹爪延伸带）
      ② X < -160 / Y < -187 ⇒ 拒绝（产品同样整件作废、机器一动不动）
      ③ X/Y > 上限 且 ≤ 上限+25mm ⇒ 钳到上限照样伸爪（极限位夹取带）；> 25mm ⇒ 拒绝
-     ④ 钳完按保护边距回拉：> 上限-5mm ⇒ 到 上限-5mm（永不朝回零开关顶满） */
+     ④ 钳完按保护边距回拉：> 上限-3mm ⇒ 到 上限-3mm（永不朝回零开关顶满） */
 uint8_t Dbg_App_Goto(float x, float y, uint16_t speed_mm_s) {
     float dx;
     float dy;
@@ -1736,72 +1980,32 @@ uint8_t Dbg_App_Goto(float x, float y, uint16_t speed_mm_s) {
         return 0u;
     }
 
-    /* ①/② -X 侧：延伸带内钳位、带外拒绝 */
-    if (x < DBG_CFG_XY_X_MIN_MM) {
-        if (x < DBG_CFG_PROD_X_CLAMP_MM) {
-            Dbg_Printf("[FAIL] X ");
-            Dbg_App_PrintF1(x);
-            Dbg_Printf(" 超出夹爪延伸带（下限 %d）——夹爪延伸也够不着，拒绝"
-                       "（产品同样整件作废、机器一动不动）\n",
-                       (int)DBG_CFG_PROD_X_CLAMP_MM);
-            return 0u;
-        }
-        Dbg_Printf("[GOTO] X ");
-        Dbg_App_PrintF1(x);
-        Dbg_Printf(" 在夹爪延伸带内——钳到 %d 就近夹取（产品同款）\n", (int)DBG_CFG_XY_X_MIN_MM);
-        x = DBG_CFG_XY_X_MIN_MM;
-    }
-    if (y < DBG_CFG_XY_Y_MIN_MM) {
-        Dbg_Printf("[FAIL] Y ");
-        Dbg_App_PrintF1(y);
-        Dbg_Printf(" 低于工作区下限 %d（-Y 端 = 机械极限，无延伸量——产品同样整件作废）\n",
-                   (int)DBG_CFG_XY_Y_MIN_MM);
-        return 0u;
-    }
+    /* 产品同款钳位（延伸带 / 极限位夹取带 / 保护边距，与产品 Sort_ClampTarget 同序）——
+       带外即拒（产品同样整件作废、机器一动不动），带内钳完照走 */
+    {
+        float cx = x;
+        float cy = y;
 
-    /* ③ +侧极限位夹取带：带内钳到上限、带外拒绝 */
-    if (x > DBG_CFG_XY_MAX_MM) {
-        if (x > (DBG_CFG_XY_MAX_MM + DBG_CFG_PROD_CLAMP_BAND_MM)) {
-            Dbg_Printf("[FAIL] X ");
+        if (Dbg_App_ProdClamp(&cx, &cy) == 0u) {
+            Dbg_Printf("[FAIL] 目标 (");
             Dbg_App_PrintF1(x);
-            Dbg_Printf(" 超出极限位夹取带（上限 %d + 带 %dmm）——产品同样整件作废、机器一动不动\n",
-                       (int)DBG_CFG_XY_MAX_MM, (int)DBG_CFG_PROD_CLAMP_BAND_MM);
-            return 0u;
-        }
-        Dbg_Printf("[GOTO] X ");
-        Dbg_App_PrintF1(x);
-        Dbg_Printf(" 在极限位夹取带内——钳到 %d 照样伸爪（产品同款；可能夹偏/抓空，"
-                   "用户口径\"不管怎么样都直接夹\"）\n",
-                   (int)DBG_CFG_XY_MAX_MM);
-        x = DBG_CFG_XY_MAX_MM;
-    }
-    if (y > DBG_CFG_XY_MAX_MM) {
-        if (y > (DBG_CFG_XY_MAX_MM + DBG_CFG_PROD_CLAMP_BAND_MM)) {
-            Dbg_Printf("[FAIL] Y ");
+            Dbg_Printf(", ");
             Dbg_App_PrintF1(y);
-            Dbg_Printf(" 超出极限位夹取带（上限 %d + 带 %dmm）——产品同样整件作废、机器一动不动\n",
-                       (int)DBG_CFG_XY_MAX_MM, (int)DBG_CFG_PROD_CLAMP_BAND_MM);
+            Dbg_Printf(") 超出产品可达范围（-X 延伸带 %d、Y 下限 %d、+侧极限位带 %dmm）"
+                       "——产品同样整件作废、机器一动不动\n",
+                       (int)DBG_CFG_PROD_X_CLAMP_MM, (int)DBG_CFG_PROD_WORK_Y_MIN,
+                       (int)DBG_CFG_PROD_CLAMP_BAND_MM);
             return 0u;
         }
-        Dbg_Printf("[GOTO] Y ");
-        Dbg_App_PrintF1(y);
-        Dbg_Printf(" 在极限位夹取带内——钳到 %d 照样伸爪（产品同款；可能夹偏/抓空）\n",
-                   (int)DBG_CFG_XY_MAX_MM);
-        y = DBG_CFG_XY_MAX_MM;
-    }
-
-    /* ④ 保护边距：贴上限的目标回拉（产品 CFG_WORK_EDGE_MARGIN_MM，见 sort_config.h 该节） */
-    if (x > (DBG_CFG_XY_MAX_MM - DBG_CFG_PROD_WORK_EDGE_MARGIN)) {
-        Dbg_Printf("[GOTO] X 贴上限，按保护边距回拉到 ");
-        Dbg_App_PrintF1(DBG_CFG_XY_MAX_MM - DBG_CFG_PROD_WORK_EDGE_MARGIN);
-        Dbg_Printf("（产品同款：不朝回零开关顶满）\n");
-        x = DBG_CFG_XY_MAX_MM - DBG_CFG_PROD_WORK_EDGE_MARGIN;
-    }
-    if (y > (DBG_CFG_XY_MAX_MM - DBG_CFG_PROD_WORK_EDGE_MARGIN)) {
-        Dbg_Printf("[GOTO] Y 贴上限，按保护边距回拉到 ");
-        Dbg_App_PrintF1(DBG_CFG_XY_MAX_MM - DBG_CFG_PROD_WORK_EDGE_MARGIN);
-        Dbg_Printf("（产品同款：不朝回零开关顶满）\n");
-        y = DBG_CFG_XY_MAX_MM - DBG_CFG_PROD_WORK_EDGE_MARGIN;
+        if ((cx != x) || (cy != y)) {
+            Dbg_Printf("[GOTO] 贴边目标已按产品同款钳位 → 实际落点 (");
+            Dbg_App_PrintF1(cx);
+            Dbg_Printf(", ");
+            Dbg_App_PrintF1(cy);
+            Dbg_Printf(")（延伸带/极限位带/保护边距；落极限位可能夹偏/抓空）\n");
+        }
+        x = cx;
+        y = cy;
     }
 
     dx = x - s_pos_x;
@@ -2138,8 +2342,9 @@ uint8_t Dbg_App_ReadTarget(uint16_t wait_s) {
 
             (void)Dbg_Vision_TargetSnapshot(&t, &age); /* 同一个缓存条目：取它的"到帧年龄" */
             Dbg_Vision_ToMachine(&t, &mx, &my);
-            Dbg_Printf("[READ] ✓ 目标：类别 %u 形状 %u（本帧 %ums 前到）  视觉(", (unsigned)t.category,
-                       (unsigned)t.shape, (unsigned)age);
+            Dbg_Printf("[READ] ✓ 目标：类别 %u 形状 %u 数量 %u（本帧 %ums 前到）  视觉(",
+                       (unsigned)t.category, (unsigned)t.shape, (unsigned)t.count,
+                       (unsigned)age);
             Dbg_App_PrintF1(t.x_mm);
             Dbg_Printf(", ");
             Dbg_App_PrintF1(t.y_mm);
@@ -2157,7 +2362,7 @@ uint8_t Dbg_App_ReadTarget(uint16_t wait_s) {
             /* ★ 2026-10-08：预演**产品**会不会要这个目标（现场"机器不动 / 到不了夹持点"
                最常见的一条）。判据 = 产品 Sort_DoCycle 的决策树，与 dbg_config.h
                "产品工作包络与够得着就去钳位"一节逐条同序：-X 延伸带到 -160、+侧极限位夹取带
-               25mm、保护边距 5mm ⇒ 只有**带外**才整件作废。
+               25mm、保护边距 3mm（2026-10-10 5→3）⇒ 只有**带外**才整件作废。
                ★ 台架 `p`/`pick` 现在用**同一套钳位**（见 Dbg_App_Goto）⇒ 打印钳位后的实际
                  落点，并给一条可直接照抄的 `pick`（现场"台架拒绝、产品会夹"对不上的坑） */
             {
@@ -2165,30 +2370,9 @@ uint8_t Dbg_App_ReadTarget(uint16_t wait_s) {
                 float   cy  = my;
                 uint8_t bad = 0u;
 
-                if (cx < DBG_CFG_PROD_X_CLAMP_MM) {
-                    bad = 1u;
-                } else if (cx < DBG_CFG_PROD_WORK_X_MIN) {
-                    cx = DBG_CFG_PROD_WORK_X_MIN;
-                }
-                if (cy < DBG_CFG_PROD_WORK_Y_MIN) {
-                    bad = 1u;
-                }
-                if (cx > (DBG_CFG_PROD_WORK_X_MAX + DBG_CFG_PROD_CLAMP_BAND_MM)) {
-                    bad = 1u;
-                } else if (cx > DBG_CFG_PROD_WORK_X_MAX) {
-                    cx = DBG_CFG_PROD_WORK_X_MAX;
-                }
-                if (cy > (DBG_CFG_PROD_WORK_Y_MAX + DBG_CFG_PROD_CLAMP_BAND_MM)) {
-                    bad = 1u;
-                } else if (cy > DBG_CFG_PROD_WORK_Y_MAX) {
-                    cy = DBG_CFG_PROD_WORK_Y_MAX;
-                }
-                if (cx > (DBG_CFG_PROD_WORK_X_MAX - DBG_CFG_PROD_WORK_EDGE_MARGIN)) {
-                    cx = DBG_CFG_PROD_WORK_X_MAX - DBG_CFG_PROD_WORK_EDGE_MARGIN;
-                }
-                if (cy > (DBG_CFG_PROD_WORK_Y_MAX - DBG_CFG_PROD_WORK_EDGE_MARGIN)) {
-                    cy = DBG_CFG_PROD_WORK_Y_MAX - DBG_CFG_PROD_WORK_EDGE_MARGIN;
-                }
+                /* 与 `p`/`pick` 走**同一个函数**（Dbg_App_ProdClamp）——
+                   这份预演不再自己抄一遍规则（2026-10-10 去重） */
+                bad = (Dbg_App_ProdClamp(&cx, &cy) == 0u) ? 1u : 0u;
 
                 if (bad != 0u) {
                     Dbg_Printf("[READ] ⚠️ 该目标**超出产品可达范围**——工作区机械 X∈[%d,%d]、"

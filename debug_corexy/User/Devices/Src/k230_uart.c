@@ -54,6 +54,13 @@ K230_Event_e K230_FeedByte(uint8_t byte, K230_Target_t *frame_out) {
                 }
 
                 if (sum == s_buf[K230_FRAME_LEN - 1u]) {
+                    /* ★ 数量位（下标 6，2026-10-10）：**校验通过的帧一律先填**——
+                       状态 00（无目标）的帧也带数量：托盘空了的那个"0"就是它给的凭据
+                       （数量复核的第二帧常常正是无目标帧，见 sort_config.h 该节）。
+                       越界过滤在缓存层（vision_task / dbg_vision），解析器原样上报 */
+                    if (frame_out != NULL) {
+                        frame_out->count = s_buf[6];
+                    }
                     if (s_buf[2] == K230_ST_HAS_TARGET) {
                         /* frame_out 为 NULL 只表示"不要数据"，绝不能改变事件本身：
                            折进 EMPTY 会让调用方把"有目标"读成"托盘已空"，提前收工 */

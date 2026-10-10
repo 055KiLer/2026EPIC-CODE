@@ -35,4 +35,15 @@ uint32_t Dbg_Gpio_EdgeCount(Dbg_Limit_e which);
 uint32_t Dbg_Gpio_LastEdgeTick(Dbg_Limit_e which);
 void     Dbg_Gpio_ClearEdges(void);
 
+/* ★ 投放点激光检测（2026-10-09；引脚/极性/启用开关见 dbg_config.h §3.6）。
+   ⚠️ 台架实测：这套模块一次落料给的是**极窄事件**（≈1 个采样点 / µs 级）⇒ 台架侧要靠
+   **µs 级密采样**才捕得到（`Dbg_App_LaserCapture` / `Dbg_App_LaserVerifyDrop`）；
+   产品侧是 **EXTI 下降沿计数**（同样的判定语义：窗口内出现过一次检测）。
+   本文件只提供两个原子读口：
+   Dbg_Gpio_LaserRaw  = 原始电平（1=高 0=低）：极性核对时看它——把"线接反"与"宏写反"分开
+   Dbg_Gpio_LaserPart = 判定（1="检测到"，按 DBG_CFG_LASER_ACTIVE_LEVEL）
+   未启用（DBG_CFG_LASER_ENABLE=0）时两个都返回 0，且**一个脚都不碰** */
+uint8_t Dbg_Gpio_LaserRaw(void);
+uint8_t Dbg_Gpio_LaserPart(void);
+
 #endif

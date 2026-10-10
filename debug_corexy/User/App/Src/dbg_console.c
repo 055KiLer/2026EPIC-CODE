@@ -950,6 +950,73 @@ static uint8_t Dbg_Cmd_Pick(char *tok[], uint8_t n) {
     return Dbg_App_Pick(0.0f, 0.0f, 0u, 0u, (uint8_t)shape);
 }
 
+/* ★ 投放点激光检测（2026-10-09，§3.6）：现场口径 = **检测到物块变成低电平**、**落料很快**
+   （光路看到的是一段短脉冲）。所以本命令分两种量法：
+     `laser`        = 即时**原始电平 + 判定**（把"线接反 / 极性宏写反"分开）
+     `laser drop`   = **µs 级捕获落料脉冲**（段数 + 宽度）——"有效性验证"就靠它
+     `laser verify` = 产品同口径整段序列（含开爪落料）⇒ 预演"产品这一件该不该 +1"
+   `laser watch`  = 5ms 采样的慢变化观察（对准/静态遮挡；短脉冲量不到） */
+static uint8_t Dbg_Cmd_Laser(char *tok[], uint8_t n) {
+#if !DBG_CFG_LASER_ENABLE
+    (void)tok;
+    (void)n;
+    Dbg_Printf("[FAIL] 激光检测未启用（dbg_config.h §3.6 的 DBG_CFG_LASER_ENABLE=0）：\n"
+               "       接线定下来后把 ENABLE 改成 1、填准 PORT/PIN/极性宏（与产品 sort_config.h\n"
+               "       的 CFG_LASER_* 同值）再重烧——默认 0 是故意的：缺省占位脚不碰，免得占错脚\n");
+    return 0u;
+#else
+    if ((n >= 2u) && (Dbg_Cmd_StrEq(tok[1], "verify") != 0u)) {
+        (void)Dbg_App_LaserVerifyDrop();
+        return 1u;
+    }
+    if ((n >= 2u) && (Dbg_Cmd_StrEq(tok[1], "drop") != 0u)) {
+        uint32_t secs = (uint32_t)DBG_CFG_LASER_CAP_S_DEFAULT;
+
+        if (n >= 3u) {
+            int32_t v = 0;
+
+            if ((Dbg_Cmd_ParseI32(tok[2], &v) == 0u) || (v < 1) ||
+                (v > (int32_t)DBG_CFG_LASER_CAP_S_MAX)) {
+                Dbg_Printf("[FAIL] 用法：laser drop [秒]（1~%u，缺省 %u）\n",
+                           (unsigned)DBG_CFG_LASER_CAP_S_MAX,
+                           (unsigned)DBG_CFG_LASER_CAP_S_DEFAULT);
+                return 0u;
+            }
+            secs = (uint32_t)v;
+        }
+        Dbg_App_LaserCapture(secs);
+        return 1u;
+    }
+    if ((n >= 2u) && (Dbg_Cmd_StrEq(tok[1], "watch") != 0u)) {
+        uint32_t secs = 10u;
+
+        if (n >= 3u) {
+            int32_t v = 0;
+
+            if ((Dbg_Cmd_ParseI32(tok[2], &v) == 0u) || (v < 1) || (v > 60)) {
+                Dbg_Printf("[FAIL] 用法：laser watch [秒]（1~60，缺省 10）\n");
+                return 0u;
+            }
+            secs = (uint32_t)v;
+        }
+        Dbg_App_LaserWatch(secs);
+        return 1u;
+    }
+    if (n >= 2u) {
+        Dbg_Printf("[FAIL] 用法：laser / laser drop [秒] / laser verify / laser watch [秒]\n");
+        return 0u;
+    }
+    Dbg_Printf("[LASER] %s 原始电平=%s(%u)  判定=%s（\"检测到\"= %s）\n", DBG_CFG_LASER_NAME,
+               (Dbg_Gpio_LaserRaw() != 0u) ? "高" : "低", (unsigned)Dbg_Gpio_LaserRaw(),
+               (Dbg_Gpio_LaserPart() != 0u) ? "检测中" : "无检测",
+               (DBG_CFG_LASER_ACTIVE_LEVEL == GPIO_PIN_RESET) ? "低电平" : "高电平");
+    Dbg_Printf("[LASER] 有效性验证：`laser drop`（丢一块货过光路，看**段数**）——\n"
+               "        一次落料 = 1 段；宽度约 0µs 就是「一个采样点宽」的窄事件（产品靠 EXTI 沿抓）；\n"
+               "        产品整段序列预演：`laser verify`（会真松爪）\n");
+    return 1u;
+#endif
+}
+
 /* ---------------- 视觉链路 / 串口屏（2026-10-01 接入 USART2/USART6） ---------------- */
 
 /* TJC 控件名长度校验：tjc_screen.c 的缓冲按 CFG_TJC_NAME_MAX 编译期定死，超长名必须在这里拦下 */
@@ -987,7 +1054,8 @@ static void Dbg_Cmd_CntName(uint8_t row, char *out) {
     out[len] = '\0';
 }
 
-/* k230 [clr | live [秒] | sim <类别1~6> <x_mm> <y_mm> [形状0~3]]；不带参数 = 打印快照 */
+/* k230 [clr | live [秒] | raw [秒] | count [秒] | sim <类别1~6> <x_mm> <y_mm> [形状0~3] [数量]]；
+   不带参数 = 打印快照 */
 static uint8_t Dbg_Cmd_K230(char *tok[], uint8_t n) {
     if (n >= 2u) {
         if (Dbg_Cmd_StrEq(tok[1], "clr") != 0u) {
@@ -1001,7 +1069,7 @@ static uint8_t Dbg_Cmd_K230(char *tok[], uint8_t n) {
             if (n >= 3u) {
                 int32_t v = 0;
 
-                if ((Dbg_Cmd_ParseI32(tok[2], &v) == 0u) || (v < 1u) || (v > 120u)) {
+                if ((Dbg_Cmd_ParseI32(tok[2], &v) == 0u) || (v < 1) || (v > 120)) {
                     Dbg_Printf("[FAIL] 用法：k230 live [秒]（1~120，缺省 10）\n");
                     return 0u;
                 }
@@ -1009,13 +1077,42 @@ static uint8_t Dbg_Cmd_K230(char *tok[], uint8_t n) {
             }
             return Dbg_Vision_Live(secs);
         }
+        if (Dbg_Cmd_StrEq(tok[1], "empty") != 0u) {
+            uint32_t secs = 0u; /* 0 = 缺省用产品的窗长（CFG_REFILL_HOLD_MS/1000） */
+
+            if (n >= 3u) {
+                int32_t v = 0;
+
+                if ((Dbg_Cmd_ParseI32(tok[2], &v) == 0u) || (v < 0) || (v > 120)) {
+                    Dbg_Printf("[FAIL] 用法：k230 empty [秒]（1~120，缺省 = 产品窗长 %ums）\n",
+                               (unsigned)CFG_REFILL_HOLD_MS);
+                    return 0u;
+                }
+                secs = (uint32_t)v;
+            }
+            return Dbg_Vision_EmptyWindow(secs);
+        }
+        if (Dbg_Cmd_StrEq(tok[1], "count") != 0u) {
+            uint32_t secs = 10u;
+
+            if (n >= 3u) {
+                int32_t v = 0;
+
+                if ((Dbg_Cmd_ParseI32(tok[2], &v) == 0u) || (v < 1) || (v > 120)) {
+                    Dbg_Printf("[FAIL] 用法：k230 count [秒]（1~120，缺省 10）\n");
+                    return 0u;
+                }
+                secs = (uint32_t)v;
+            }
+            return Dbg_Vision_CountWatch(secs);
+        }
         if (Dbg_Cmd_StrEq(tok[1], "raw") != 0u) {
             uint32_t secs = 10u;
 
             if (n >= 3u) {
                 int32_t v = 0;
 
-                if ((Dbg_Cmd_ParseI32(tok[2], &v) == 0u) || (v < 1u) || (v > 120u)) {
+                if ((Dbg_Cmd_ParseI32(tok[2], &v) == 0u) || (v < 1) || (v > 120)) {
                     Dbg_Printf("[FAIL] 用法：k230 raw [秒]（1~120，缺省 10）\n");
                     return 0u;
                 }
@@ -1029,11 +1126,12 @@ static uint8_t Dbg_Cmd_K230(char *tok[], uint8_t n) {
             int32_t  x     = 0;
             int32_t  y     = 0;
             uint16_t shape = 0u; /* 缺省 0 = 默认方案；给 4+ 故意放行，可用来验"形状越界=不可用" */
+            uint16_t cnt   = 0u; /* 数量位（下标 6，2026-10-10 协议新增），缺省 0 */
 
             if ((n < 5u) || ((cat = Dbg_Cmd_ParseU16(tok[2], &ok), (ok == 0u) || (cat < 1u) ||
                              (cat > (uint16_t)CFG_NUM_CATEGORIES))) ||
                 (Dbg_Cmd_ParseI32(tok[3], &x) == 0u) || (Dbg_Cmd_ParseI32(tok[4], &y) == 0u)) {
-                Dbg_Printf("[FAIL] 用法：k230 sim <类别1~6> <x_mm> <y_mm> [形状0~3]"
+                Dbg_Printf("[FAIL] 用法：k230 sim <类别1~6> <x_mm> <y_mm> [形状0~3] [数量0~255]"
                            "（本地合成一帧喂进解析器，验解析->缓存->换算，不接线也能测）\n");
                 return 0u;
             }
@@ -1044,10 +1142,18 @@ static uint8_t Dbg_Cmd_K230(char *tok[], uint8_t n) {
                     return 0u;
                 }
             }
-            Dbg_Vision_SimFeed((uint8_t)cat, (uint8_t)shape, (float)x, (float)y);
+            if (n >= 7u) {
+                cnt = Dbg_Cmd_ParseU16(tok[6], &ok);
+                if ((ok == 0u) || (cnt > 255u)) {
+                    Dbg_Printf("[FAIL] 数量参数须为数字 0~255（缺省 0）\n");
+                    return 0u;
+                }
+            }
+            Dbg_Vision_SimFeed((uint8_t)cat, (uint8_t)shape, (float)x, (float)y, (uint8_t)cnt);
             return 1u;
         }
-        Dbg_Printf("[FAIL] 用法：k230 / k230 clr / k230 live [秒] / k230 raw [秒] / k230 sim <类别> <x> <y> [形状]\n");
+        Dbg_Printf("[FAIL] 用法：k230 / k230 clr / k230 live [秒] / k230 raw [秒] / k230 count [秒] /"
+                   " k230 sim <类别> <x> <y> [形状] [数量]\n");
         return 0u;
     }
     Dbg_Vision_Print();
@@ -1148,7 +1254,7 @@ static uint8_t Dbg_Cmd_Read(char *tok[], uint8_t n) {
     int32_t s = 0;
 
     if (n >= 2u) {
-        if ((Dbg_Cmd_ParseI32(tok[1], &s) == 0u) || (s < 0u) || (s > 120u)) {
+        if ((Dbg_Cmd_ParseI32(tok[1], &s) == 0u) || (s < 0) || (s > 120)) {
             Dbg_Printf("[FAIL] 用法：read [等待秒]（1~120，缺省 10；任意键中止）\n");
             return 0u;
         }
@@ -1197,7 +1303,8 @@ static const Dbg_Cmd_t s_cmd[] = {
     {"tspd", "<20~400>", "★转盘节拍百分比（默认 400 = 产品当前标定 480/240/120rpm；丢步就回 200）", Dbg_Cmd_Tspd},
     {"fmt", "<13|16>", "★位置帧格式：16=V2说明书(0.1°/0.1RPM) 13=老协议(脉冲/RPM)", Dbg_Cmd_Fmt},
     {"lim", "[clr]", "★限位/原点开关：电平 + 按压计数（消抖+闩锁，只认压下；clr 清零）。撞限位判据=电平连续压住≥10ms（真撞才急停+作废）；毛刺见运动中 [INFO] 行", Dbg_Cmd_Lim},
-    {"k230", "[clr|live [s]|raw [s]|sim 类 x y [形状]]", "★视觉链路(USART2)：快照+换算 / 清缓存 / 实时流(任意键停) / ★raw=线上真相(逐帧 hex+解码+校验判决) / 本地注帧(形状0~3缺省0)", Dbg_Cmd_K230},
+    {"laser", "[drop [s]|verify|watch [s]]", "★投放点激光检测(§3.6，接 PD14/检测到=低；2026-10-10 起**已退出计数闸门**——爪挡光路，判据换成视觉数量位，本命令留给模块自身验收)：即时原始电平+判定 / ★drop=µs级捕获落料脉冲(段数+宽度；上机实测≈0~1µs=窄事件) / verify=整段序列预演(静置→开爪落料→窗口捕获→判定；会真松爪) / watch=5ms慢变化观察(对准用，短脉冲量不到；任意键停)", Dbg_Cmd_Laser},
+    {"k230", "[clr|live [s]|raw [s]|count [s]|empty [s]|sim 类 x y [形状] [数量]]", "★视觉链路(USART2)：快照+换算(含数量位) / 清缓存 / 实时流(任意键停) / ★raw=线上真相(逐帧 hex+解码+校验) / ★count=数量位观察(拿放一件看它变) / ★empty=空盘静默窗预演(那 5 秒从哪开始算、管不管用) / 本地注帧(形状0~3缺省0、数量缺省0)", Dbg_Cmd_K230},
     {"read", "[等待s]", "★到读帧位再取目标：goto投放点+静默+清缓存+等新鲜帧，给出 pick 坐标（抓取依据必须出自它；超时判词分诊：流里没有可用目标帧——报0x00无目标/帧越界/帧没到，并给出\"最后一次报它多久前\"；1008c 起成功行还预演产品钳位=给钳位后落点+可照抄的 pick）", Dbg_Cmd_Read},
     {"scr", "<控件名> <数值>", "★屏(USART6)：发 控件名.val=数值+FFFFFF（如 scr n1 5）", Dbg_Cmd_ScrVal},
     {"scrp", "<控件名> <图片号>", "★屏：发 控件名.pic=图片号（整图切换）", Dbg_Cmd_ScrPic},

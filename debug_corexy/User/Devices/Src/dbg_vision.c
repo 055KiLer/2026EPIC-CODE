@@ -20,6 +20,12 @@ static uint32_t      s_cnt_target;    /* 可用目标帧数 */
 static uint32_t      s_cnt_empty;     /* 无目标帧数（状态 0x00） */
 static uint32_t      s_cnt_bad;       /* 有目标但类别/形状越界（= 上位机与主控口径不一致） */
 static uint8_t       s_seen;          /* 上电以来有没有收过任何校验通过的帧 */
+/* ★ 数量位（2026-10-10 协议新增，下标 6）：与"可用目标"无关，**无目标帧也照记**——
+   托盘空了的那个 0 只有无目标帧才给（产品的数量复核就靠它，见产品 sort_config.h 该节） */
+static uint8_t       s_count;         /* 最近一帧的数量位 */
+static uint8_t       s_count_valid;   /* 1 = 清缓存以来已经来过至少一帧 */
+static uint8_t       s_count_state;   /* 那一帧的状态位（1=有目标 0=无目标），`k230 count` 用 */
+static uint32_t      s_count_tick;    /* 那一帧的到达时刻 */
 
 /* 浮点打印成 d.d（自写格式器没有 %f；同 dbg_app.c 的 PrintF1） */
 static void Dbg_Vision_PrintF1(float v) {
@@ -96,6 +102,11 @@ static void Dbg_Vision_ApplyEvent(K230_Event_e ev, const K230_Target_t *frame, u
     }
     s_frame_tick = now;
     s_seen       = 1u;
+    /* ★ 数量位先记（与可用目标无关）：无目标帧/越界帧同样更新——托盘空的 0 靠这一条 */
+    s_count       = frame->count;
+    s_count_state = (ev == K230_EV_TARGET) ? 1u : 0u;
+    s_count_valid = 1u;
+    s_count_tick  = now;
 
     usable = (ev == K230_EV_TARGET) && (frame->category >= 1u) &&
              (frame->category <= (uint8_t)CFG_NUM_CATEGORIES) &&
@@ -135,6 +146,33 @@ void Dbg_Vision_Flush(void) {
     s_seen         = 0u;
     s_frame_tick   = HAL_GetTick();
     s_target_tick  = HAL_GetTick();
+    /* 数量位也重新起算（= 产品 Vision_Flush 同口径）：返回"还没来帧"与"来了一帧数量 0"是两件事 */
+    s_count       = 0u;
+    s_count_valid = 0u;
+    s_count_state = 0u;
+    s_count_tick  = HAL_GetTick();
+}
+
+/* 取"最近一帧的数量位"（含无目标帧）。
+   @retval 1 = 取到（清缓存以来已经有校验通过的帧）  0 = 还没来帧 */
+uint8_t Dbg_Vision_GetCount(uint8_t *out) {
+    if (out == NULL) {
+        return 0u;
+    }
+    if (s_count_valid == 0u) {
+        return 0u;
+    }
+    *out = s_count;
+    return 1u;
+}
+
+/* 数量位的到达时刻（`k230` 快照打"多少 ms 前"用；0 = 还没来帧） */
+uint32_t Dbg_Vision_CountAge(void) {
+    return (s_count_valid != 0u) ? (HAL_GetTick() - s_count_tick) : 0u;
+}
+
+uint8_t Dbg_Vision_CountState(void) {
+    return (s_count_valid != 0u) ? s_count_state : 0xFFu;
 }
 
 void Dbg_Vision_Print(void) {
@@ -151,8 +189,9 @@ void Dbg_Vision_Print(void) {
         float my = 0.0f;
 
         Dbg_Vision_ToMachine(&s_target, &mx, &my);
-        Dbg_Printf("[K230] 缓存目标：类别 %u 形状 %u（%ums 前），视觉系 (", (unsigned)s_target.category,
-                   (unsigned)s_target.shape, (unsigned)(now - s_target_tick));
+        Dbg_Printf("[K230] 缓存目标：类别 %u 形状 %u 数量 %u（%ums 前），视觉系 (",
+                   (unsigned)s_target.category, (unsigned)s_target.shape,
+                   (unsigned)s_target.count, (unsigned)(now - s_target_tick));
         Dbg_Vision_PrintF1(s_target.x_mm);
         Dbg_Printf(", ");
         Dbg_Vision_PrintF1(s_target.y_mm);
@@ -163,6 +202,16 @@ void Dbg_Vision_Print(void) {
         Dbg_Printf(")mm\n");
     } else {
         Dbg_Printf("[K230] 缓存目标：无\n");
+    }
+
+    /* ★ 数量位（2026-10-10 协议新增）：数量复核的唯一输入。这一行是"上位机到底填没填"的
+       现场判据——恒 0 或与 `k230 count` 手动拿放对不上，就是上位机侧还没实现下标 6 */
+    if (s_count_valid != 0u) {
+        Dbg_Printf("[K230] 最近一帧数量位 = %u（%ums 前，状态 %s）——产品侧\"两帧差 1\"的输入\n",
+                   (unsigned)s_count, (unsigned)(now - s_count_tick),
+                   (s_count_state == 1u) ? "有目标" : "无目标");
+    } else {
+        Dbg_Printf("[K230] 最近一帧数量位：**还没来帧**（清缓存后一帧未到）\n");
     }
 
     Dbg_Printf("[K230] 收帧计数：可用目标 %u / 无目标 %u / 越界 %u"
@@ -212,8 +261,8 @@ uint8_t Dbg_Vision_Live(uint32_t seconds) {
             float my = 0.0f;
 
             Dbg_Vision_ToMachine(&s_target, &mx, &my);
-            Dbg_Printf("[K230] 类别 %u 形状 %u  视觉(", (unsigned)s_target.category,
-                       (unsigned)s_target.shape);
+            Dbg_Printf("[K230] 类别 %u 形状 %u 数量 %u  视觉(", (unsigned)s_target.category,
+                       (unsigned)s_target.shape, (unsigned)s_target.count);
             Dbg_Vision_PrintF1(s_target.x_mm);
             Dbg_Printf(", ");
             Dbg_Vision_PrintF1(s_target.y_mm);
@@ -226,9 +275,11 @@ uint8_t Dbg_Vision_Live(uint32_t seconds) {
 
         if ((int32_t)(HAL_GetTick() - next_report) >= 0) {
             next_report += 1000u;
-            Dbg_Printf("[K230] … 无目标+%u 越界+%u（累计 目标%u/空%u/坏%u）\n",
+            Dbg_Printf("[K230] … 无目标+%u 越界+%u（累计 目标%u/空%u/坏%u）最近数量 %s%u\n",
                        (unsigned)(s_cnt_empty - empty0), (unsigned)(s_cnt_bad - bad0),
-                       (unsigned)s_cnt_target, (unsigned)s_cnt_empty, (unsigned)s_cnt_bad);
+                       (unsigned)s_cnt_target, (unsigned)s_cnt_empty, (unsigned)s_cnt_bad,
+                       (s_count_valid != 0u) ? "" : "（还没来帧）",
+                       (unsigned)s_count);
         }
     }
 
@@ -278,11 +329,13 @@ static uint8_t Dbg_Vision_RawFrame(const uint8_t *f, uint8_t force, uint32_t *n_
         return kind;
     }
     if (kind == 2u) {
-        Dbg_Printf("| 状态 00 = 本帧无目标（上位机在说：没有可抓的东西）\n");
+        Dbg_Printf("| 状态 00 = 本帧无目标（上位机在说：没有可抓的东西）数量位 = %u\n",
+                   (unsigned)f[6]);
         return kind;
     }
     if (kind == 4u) {
-        Dbg_Printf("| 状态 %02X 既不是 00 也不是 01 —— 本机当无目标处理\n", (unsigned)f[2]);
+        Dbg_Printf("| 状态 %02X 既不是 00 也不是 01 —— 本机当无目标处理（数量位 = %u）\n",
+                   (unsigned)f[2], (unsigned)f[6]);
         return kind;
     }
 
@@ -297,17 +350,18 @@ static uint8_t Dbg_Vision_RawFrame(const uint8_t *f, uint8_t force, uint32_t *n_
         t.category = f[3];
         t.shape    = f[4];
         t.has_qr   = f[5];
+        t.count    = f[6];
         t.x_mm     = (float)x10 * 0.1f;
         t.y_mm     = (float)y10 * 0.1f;
         Dbg_Vision_ToMachineImpl(&t, &mx, &my);
 
         if ((t.category >= 1u) && (t.category <= (uint8_t)CFG_NUM_CATEGORIES) &&
             (t.shape <= (uint8_t)CFG_NUM_SHAPES)) {
-            Dbg_Printf("| 目标帧 类别 %u 形状 %u [可用]  帧XY(", (unsigned)t.category,
-                       (unsigned)t.shape);
+            Dbg_Printf("| 目标帧 类别 %u 形状 %u 数量 %u [可用]  帧XY(", (unsigned)t.category,
+                       (unsigned)t.shape, (unsigned)t.count);
         } else {
-            Dbg_Printf("| 目标帧 类别 %u 形状 %u [★越界→本机按设计丢弃]  帧XY(", (unsigned)t.category,
-                       (unsigned)t.shape);
+            Dbg_Printf("| 目标帧 类别 %u 形状 %u 数量 %u [★越界→本机按设计丢弃]  帧XY(",
+                       (unsigned)t.category, (unsigned)t.shape, (unsigned)t.count);
         }
         Dbg_Vision_PrintF1(t.x_mm);
         Dbg_Printf(", ");
@@ -440,7 +494,7 @@ uint8_t Dbg_Vision_Raw(uint32_t seconds) {
     }
 }
 
-void Dbg_Vision_SimFeed(uint8_t category, uint8_t shape, float x_mm, float y_mm) {
+void Dbg_Vision_SimFeed(uint8_t category, uint8_t shape, float x_mm, float y_mm, uint8_t count) {
     uint8_t f[12];
     uint8_t sum = 0u;
     int16_t x10 = (int16_t)(x_mm * 10.0f + ((x_mm >= 0.0f) ? 0.5f : -0.5f));
@@ -452,7 +506,7 @@ void Dbg_Vision_SimFeed(uint8_t category, uint8_t shape, float x_mm, float y_mm)
     f[3] = category;
     f[4] = shape; /* 形状 0~3（2026-10-01：0=默认方案、1~3=特调；不参与分类） */
     f[5] = 0u; /* hasQR */
-    f[6] = 0u; /* 保留 */
+    f[6] = count; /* ★ 数量位（2026-10-10）：本地注帧也带上，验解析->缓存->快照整条链 */
     f[7] = (uint8_t)(x10 & 0xFF); /* X int16 小端，0.1mm */
     f[8] = (uint8_t)((x10 >> 8) & 0xFF);
     f[9] = (uint8_t)(y10 & 0xFF); /* Y int16 小端，0.1mm */
@@ -469,16 +523,210 @@ void Dbg_Vision_SimFeed(uint8_t category, uint8_t shape, float x_mm, float y_mm)
         Dbg_Vision_ApplyEvent(ev, &frame, HAL_GetTick()); /* 入账口与 Poll 共用：缓存/计数都更新 */
     }
 
-    Dbg_Printf("[K230] 已本地注入一帧：类别 %u 形状 %u 视觉(", (unsigned)category,
-               (unsigned)shape);
+    Dbg_Printf("[K230] 已本地注入一帧：类别 %u 形状 %u 数量 %u 视觉(", (unsigned)category,
+               (unsigned)shape, (unsigned)count);
     Dbg_Vision_PrintF1(x_mm);
     Dbg_Printf(", ");
     Dbg_Vision_PrintF1(y_mm);
     Dbg_Printf(")mm —— `k230` 看缓存与换算结果\n");
 }
 
+/* ★ `k230 count [秒]`：**数量位观察**——只在数量（或状态）变化时打一行。
+   用途（2026-10-10 现场口径）：拿一件货出去 / 放一件进来，看数量位跟着变——
+   这是"上位机到底填没填下标 6、填得对不对"的正面证据，也是产品"两帧差 1"判据的输入体检。
+   与 `live` 的区别：`live` 追的是**目标帧**（行随目标变），这里追的是**数量**（含无目标帧，
+   托盘空了的 0 也要能看见）。任意键中止（读掉的字节丢弃，不排进命令队列） */
+uint8_t Dbg_Vision_CountWatch(uint32_t seconds) {
+    uint32_t t0;
+    uint8_t  last_valid   = 0u;
+    uint8_t  last_count   = 0u;
+    uint8_t  last_state   = 0xFFu;
+    uint8_t  stale_warned = 0u;
+    uint32_t changes      = 0u;
+
+    if ((seconds == 0u) || (seconds > 120u)) {
+        seconds = 10u;
+    }
+
+    Dbg_Vision_Print();
+    Dbg_Printf("[K230] 数量位观察 %us：只在数量/状态**变化**时打一行（拿一件出去试试）。任意键中止\n",
+               (unsigned)seconds);
+
+    t0 = HAL_GetTick();
+    for (;;) {
+        uint32_t age;
+
+        if (Dbg_Uart_Available() > 0u) {
+            while (Dbg_Uart_Available() > 0u) {
+                (void)Dbg_Uart_ReadByte();
+            }
+            Dbg_Printf("[K230] 数量位观察被中止（收到控制台字节）\n");
+            return 1u;
+        }
+
+        Dbg_Vision_Poll();
+
+        /* 新鲜度先判：帧周期 100ms，2s 没新帧就是链路/上位机的问题（不是"数量没变"） */
+        age = (s_count_valid != 0u) ? (HAL_GetTick() - s_count_tick) : 0xFFFFFFFFu;
+
+        if (age <= 2000u) {
+            stale_warned = 0u;
+            if ((last_valid == 0u) || (s_count != last_count) || (s_count_state != last_state)) {
+                if (last_valid != 0u) {
+                    changes++;
+                }
+                last_valid = 1u;
+                last_count = s_count;
+                last_state = s_count_state;
+                Dbg_Printf("[K230] t=%ums 数量 = %u（状态 %s，帧 %ums 前）\n",
+                           (unsigned)(HAL_GetTick() - t0), (unsigned)s_count,
+                           (s_count_state == 1u) ? "有目标" : "无目标", (unsigned)age);
+            }
+        } else if (stale_warned == 0u) {
+            stale_warned = 1u;
+            Dbg_Printf("[K230] ⚠️ 2s 内没有新的校验通过帧（数量位%s）——查线/波特率/上位机是否在发\n",
+                       (last_valid != 0u) ? "停在上面那个值" : "一次都没读到");
+        }
+
+        if ((HAL_GetTick() - t0) >= (seconds * 1000u)) {
+            break;
+        }
+    }
+
+    if (last_valid == 0u) {
+        Dbg_Printf("[K230] 数量位观察 %us 结束：一次都没读到\n", (unsigned)seconds);
+        return 1u;
+    }
+    Dbg_Printf("[OK] 数量位观察 %us 结束：变化 %u 次，最后数量 = %u\n", (unsigned)seconds,
+               (unsigned)changes, (unsigned)last_count);
+    if (changes == 0u) {
+        Dbg_Printf("[K230] ⚠️ 窗口内只读到 1 个值（数量没变过）：拿/放一件货应当让它变一次；\n"
+                   "       若手动拿放也不变 ⇒ 数量位没在算（上位机未实现下标 6）= 产品侧\n"
+                   "       会表现为「夹空/投放都判不出来、屏上不动」\n");
+    }
+    return 1u;
+}
+
+/* ★ `k230 empty [秒]`：**空盘静默窗预演**（= 产品 `CFG_REFILL_HOLD_MS` 的台架时间线）。
+   回答"那 5 秒到底管不管用、从哪儿开始算"——产品侧的次序是（口径见产品 sort_config.h
+   的"数量复核"一节）：
+     最后一件落盒（投放）→ **+0.6s 左右读到"数量 0 的帧"（零帧）** ⇒ 从这一刻起静默
+     CFG_REFILL_HOLD_MS（默认 5000ms）**什么都不读**（不取帧、不计判、不刷屏）⇒ 窗满后
+     清缓存、重走"到读帧位 + 静默期 + 取帧" ⇒ 下一件的**发车帧**是补货之后的新账。
+   所以操作员的可用时间 ≈ 落盒后 0.6s + 5000ms ≈ 5.6s；**窗内怎么放都不影响账**，
+   窗后才放（或在窗内被机器"看见"）才会让那一件判不出"减一"（可见少计）。
+   台架这条命令把这条时间线**放慢给你看**（台架不在产品的读帧位上，但数量口径同一个）：
+     ① 等你**把最后一件拿走**（数量首次读到 0）——那一刻就是"读到零帧"，窗从它起算；
+     ② 窗内 N 秒：数量变化照打，但每一条都标「窗内忽略」——这正是你往里补货的窗口；
+     ③ 窗满：打印"窗口结束 ⇒ 产品从这里重新取帧"，并读一帧给出"下一件的发车帧数量"。
+   期间任意键中止。 */
+uint8_t Dbg_Vision_EmptyWindow(uint32_t seconds) {
+    uint32_t t0;
+    uint32_t win_ms;
+    uint8_t  last_count = 0u;
+    uint8_t  got_zero   = 0u;
+
+    if ((seconds == 0u) || (seconds > 120u)) {
+        seconds = (uint32_t)CFG_REFILL_HOLD_MS / 1000u; /* 缺省 = 产品的窗长（5s） */
+        if (seconds == 0u) {
+            seconds = 5u;
+        }
+    }
+    win_ms = seconds * 1000u;
+
+    Dbg_Vision_Print();
+    Dbg_Printf("[K230] 空盘静默窗预演：窗长 %us（产品 CFG_REFILL_HOLD_MS = %ums）。\n",
+               (unsigned)seconds, (unsigned)CFG_REFILL_HOLD_MS);
+    Dbg_Printf("[K230] ① 现在**把最后一件货拿走**（等数量读到 0 = 产品说的「读到零帧」）……"
+               "任意键中止\n");
+
+    t0 = HAL_GetTick();
+    for (;;) {
+        uint32_t age;
+
+        if (Dbg_Uart_Available() > 0u) {
+            while (Dbg_Uart_Available() > 0u) {
+                (void)Dbg_Uart_ReadByte();
+            }
+            Dbg_Printf("[K230] 空盘静默窗预演被中止\n");
+            return 1u;
+        }
+        Dbg_Vision_Poll();
+
+        age = (s_count_valid != 0u) ? (HAL_GetTick() - s_count_tick) : 0xFFFFFFFFu;
+
+        if (got_zero == 0u) {
+            if (age > 2000u) {
+                Dbg_Printf("[K230] ⚠️ 2s 内没有新的校验通过帧 —— 先查线/波特率/上位机是否在发\n");
+                return 1u;
+            }
+            if ((s_count_valid != 0u) && (s_count == 0u)) {
+                got_zero = 1u;
+                t0       = HAL_GetTick();
+                Dbg_Printf("[K230] ② 数量 == 0 ⇒ **静默窗从这里开始**（产品也是这一刻起算）："
+                           "接下来 %us 里数量怎么变都是「窗内」——机器不取帧\n",
+                           (unsigned)seconds);
+                continue;
+            }
+            if ((int32_t)(HAL_GetTick() - t0) >= 30000) {
+                Dbg_Printf("[K230] 30s 没等到数量 0（当前 %s%u）——先拿空托盘？\n",
+                           (s_count_valid != 0u) ? "" : "（还没来帧）", (unsigned)s_count);
+                return 1u;
+            }
+            continue;
+        }
+
+        /* 窗内：只观察、不判定（产品此刻"什么都不读"） */
+        if ((s_count_valid != 0u) && (s_count != last_count)) {
+            last_count = s_count;
+            Dbg_Printf("[K230]   窗内 t=%ums 数量 -> %u（**窗内忽略**：产品此刻不取帧，"
+                       "你怎么放都不影响账）\n",
+                       (unsigned)(HAL_GetTick() - t0), (unsigned)s_count);
+        }
+        {
+            uint32_t elapsed = HAL_GetTick() - t0;
+
+            if (elapsed >= win_ms) {
+                break;
+            }
+        }
+    }
+
+    Dbg_Printf("[K230] ③ 窗口结束（%us）⇒ **产品从这里开始重新取帧**：清缓存 → 到读帧位 → "
+               "静默 %ums → 取「下一件的发车帧」\n",
+               (unsigned)seconds, (unsigned)CFG_VISION_SETTLE_MS);
+    Dbg_Vision_Flush();
+    t0 = HAL_GetTick();
+    for (;;) {
+        if (Dbg_Uart_Available() > 0u) {
+            while (Dbg_Uart_Available() > 0u) {
+                (void)Dbg_Uart_ReadByte();
+            }
+            Dbg_Printf("[K230] （窗后取帧被中止）\n");
+            return 1u;
+        }
+        Dbg_Vision_Poll();
+        if (Dbg_Vision_GetCount(&last_count) != 0u) {
+            Dbg_Printf("[K230] 窗后第一帧：数量 = %u ⇒ 这就是产品这一轮**发车帧**的数量"
+                       "（补货放完了就应该是这件货的稳定值）\n",
+                       (unsigned)last_count);
+            if (last_count == 0u) {
+                Dbg_Printf("[K230] ⚠️ 还是 0：你没往里放 / 没放稳 / 补货停了 —— "
+                           "产品会一直等（不动作，也不是故障）\n");
+            }
+            return 1u;
+        }
+        if ((int32_t)(HAL_GetTick() - t0) >= 3000) {
+            Dbg_Printf("[K230] ⚠️ 窗后 3s 没读到帧：查链路/上位机\n");
+            return 1u;
+        }
+    }
+}
+
 void Dbg_Vision_PrintStatusLine(void) {
-    Dbg_Printf("[STAT] 视觉 链路=%s 目标帧=%u 无目标=%u 越界=%u（`k230` 看快照与换算）\n",
+    Dbg_Printf("[STAT] 视觉 链路=%s 目标帧=%u 无目标=%u 越界=%u 数量位=%s%u（`k230` 看快照与换算）\n",
                (Dbg_Vision_LinkAlive() != 0u) ? "活" : "无流量", (unsigned)s_cnt_target,
-               (unsigned)s_cnt_empty, (unsigned)s_cnt_bad);
+               (Dbg_Vision_LinkAlive() != 0u) ? "活" : "无流量", (unsigned)s_cnt_target,
+               (unsigned)s_cnt_empty, (unsigned)s_cnt_bad,
+               (s_count_valid != 0u) ? "" : "（还没来帧）", (unsigned)s_count);
 }

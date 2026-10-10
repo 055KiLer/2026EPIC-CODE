@@ -53,8 +53,12 @@ static volatile uint32_t s_raw_tick[DBG_LIMIT_COUNT];
 void Dbg_Gpio_Init(void) {
     GPIO_InitTypeDef init = {0};
 
+    /* 四个端口时钟一次给全（与产品 Core/Src/gpio.c 同写法）：激光脚换成哪个端口
+       都不用再回来想时钟的事——§3.6 只改 PORT/PIN 两行 */
+    __HAL_RCC_GPIOA_CLK_ENABLE();
     __HAL_RCC_GPIOB_CLK_ENABLE();
     __HAL_RCC_GPIOC_CLK_ENABLE();
+    __HAL_RCC_GPIOD_CLK_ENABLE();
 
     /* 与产品 gpio.c 同配置：EXTI 下降沿 + 内部上拉。
        改成上升沿会让"压下=触发"变"松开=触发"，回零一类的判据全部跟着错 */
@@ -67,6 +71,15 @@ void Dbg_Gpio_Init(void) {
 
     init.Pin = DBG_CFG_LIMIT_Y_PIN; /* PC5 在 GPIOC */
     (void)HAL_GPIO_Init(DBG_CFG_LIMIT_Y_PORT, &init);
+
+#if DBG_CFG_LASER_ENABLE
+    /* ★ 投放点激光检测（§3.6）：上拉输入，**不配 EXTI**（稳态量，没有沿语义）。
+       ENABLE=0 时这段整个不编译 = 缺省一个脚都不碰（占错脚会毁控制台，见 §3.6） */
+    init.Mode = GPIO_MODE_INPUT;
+    init.Pull = GPIO_PULLUP;
+    init.Pin  = DBG_CFG_LASER_PIN;
+    (void)HAL_GPIO_Init(DBG_CFG_LASER_PORT, &init);
+#endif
 
     /* 抢占 0 高于串口（5）：沿不能丢，与产品工程同优先级。
        中断服务函数在 stm32f4xx_it.c，落到下面的 HAL_GPIO_EXTI_Callback */
@@ -96,6 +109,28 @@ uint8_t Dbg_Gpio_Level(Dbg_Limit_e which) {
 
 uint32_t Dbg_Gpio_EdgeCount(Dbg_Limit_e which) {
     return (which < DBG_LIMIT_COUNT) ? s_edges[which] : 0u;
+}
+
+/* ★ 投放点激光检测（2026-10-09）：原始电平。极性核对看这条——"模块检测到物块时输出高还是低"
+   是**接线/模块手册**的事实，固件这边只是把它翻译成"检测到/无检测"（见 §3.6；现场实测 = 低） */
+uint8_t Dbg_Gpio_LaserRaw(void) {
+#if DBG_CFG_LASER_ENABLE
+    return (HAL_GPIO_ReadPin(DBG_CFG_LASER_PORT, DBG_CFG_LASER_PIN) == GPIO_PIN_SET) ? 1u : 0u;
+#else
+    return 0u; /* 未启用：命令层已给出"去 §3.6 打开"的提示，这里不碰引脚 */
+#endif
+}
+
+/* 判定：1 = "检测到"（= 原始电平等于 DBG_CFG_LASER_ACTIVE_LEVEL）。与产品
+   Bsp_Gpio_LaserPart 同一条语义（产品那边少了一层"启用开关"——它用编译期分支） */
+uint8_t Dbg_Gpio_LaserPart(void) {
+#if DBG_CFG_LASER_ENABLE
+    return (HAL_GPIO_ReadPin(DBG_CFG_LASER_PORT, DBG_CFG_LASER_PIN) == DBG_CFG_LASER_ACTIVE_LEVEL)
+               ? 1u
+               : 0u;
+#else
+    return 0u;
+#endif
 }
 
 uint32_t Dbg_Gpio_LastEdgeTick(Dbg_Limit_e which) {
