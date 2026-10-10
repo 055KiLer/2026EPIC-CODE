@@ -121,7 +121,7 @@ void USART6_IRQHandler(void)
   HAL_UART_IRQHandler(&huart6);
 }
 
-/* EXTI0 = 转盘原点，EXTI1 = X 限位，EXTI9_5 = Y 限位 */
+/* EXTI0 = 转盘原点，EXTI1 = X 限位，EXTI9_5 = Y 限位，EXTI15_10 = 投放点激光检测（PD14/EXTI14） */
 void EXTI0_IRQHandler(void)
 {
   HAL_GPIO_EXTI_IRQHandler(TRAY_ORIGIN_Pin);
@@ -135,4 +135,12 @@ void EXTI1_IRQHandler(void)
 void EXTI9_5_IRQHandler(void)
 {
   HAL_GPIO_EXTI_IRQHandler(Y_LIMIT_Pin);
+}
+
+/* 2026-10-09：投放点激光检测（PD14 = EXTI14）。处理体在 bsp_gpio.c 的
+   HAL_GPIO_EXTI_Callback —— **只给"检测到"的沿计数**（台架实测：一次落料 ≈1µs 宽的
+   窄事件，1ms 电平轮询抓不到，所以必须靠沿），真伪由 App 的投放窗口把关 */
+void EXTI15_10_IRQHandler(void)
+{
+  HAL_GPIO_EXTI_IRQHandler(LASER_PART_Pin);
 }

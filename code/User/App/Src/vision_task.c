@@ -6,6 +6,9 @@
  *            链路活着   = 最近 CFG_K230_LINK_DEAD_MS 内有校验通过的帧（上位机停发 = 链路故障，
  *                         绝不等同于"托盘已空"，所以上位机无目标时也必须照周期发状态 0x00 帧）
  *            托盘已空   = 链路活着 且 连续 M 帧无目标（只影响轮询间隔，不是终止态）
+ *          ★ 第四个判据（2026-10-10）：**最近一帧的数量位**（含无目标帧）——分拣任务的数量
+ *            复核用（发车帧 vs 到账帧差 1）。清缓存后"还没来帧"与"来了帧数量 0"必须分得清，
+ *            所以它有独立的 valid 标志（不进 target 结构，也不受"越界=无目标"影响）。
  *          缓存整体在临界区内读写，分拣任务取到的必是"同一帧的数据 + 时间戳 + 标志"
  */
 #include "vision_task.h"
@@ -22,6 +25,9 @@ typedef struct {
     uint32_t      frame_tick;  /* 最近一次校验通过帧的时刻（链路活性） */
     uint32_t      none_cnt;    /* 连续"无目标"帧数 */
     uint8_t       consumed;    /* 已被分拣任务领走 */
+    uint8_t       count;       /* ★ 最近一帧的数量位 */
+    uint8_t       count_valid; /* 1 = 清缓存之后已经来过至少一帧（count 才是可信的） */
+    uint32_t      count_tick;  /* count 那一帧的到达时刻 */
 } Vision_Cache_t;
 
 static Vision_Cache_t s_cache;
@@ -39,6 +45,10 @@ static void Vision_UpdateCache(K230_Event_e event, const K230_Target_t *frame) {
 
     taskENTER_CRITICAL();
     s_cache.frame_tick = now;
+    /* ★ 数量位与"可用目标"无关：无目标帧、越界帧都照记——空盘的 0 正是无目标帧给的 */
+    s_cache.count       = frame->count;
+    s_cache.count_valid = 1u;
+    s_cache.count_tick  = now;
 
     if (usable) {
         s_cache.target      = *frame;
@@ -87,6 +97,25 @@ uint8_t Vision_GetTarget(K230_Target_t *out) {
     return 1u;
 }
 
+/* ★ 最近一帧的数量位（2026-10-10 数量复核用）：含**无目标帧**——空盘的 0 只有无目标帧才给。
+   清缓存后 count_valid=0，所以在"清缓存 + 等第一帧"的口径里，返回 0 = **还没来帧**，
+   返回 1 = **这一帧真的在看**（数量 0 与没来帧彻底分开，复核不会把"没来帧"当成"空了"） */
+uint8_t Vision_GetCount(uint8_t *out) {
+    if (out == NULL) {
+        return 0u;
+    }
+
+    taskENTER_CRITICAL();
+    uint8_t ok = (s_cache.count_valid != 0u) &&
+                 ((HAL_GetTick() - s_cache.count_tick) <= CFG_K230_LINK_DEAD_MS);
+
+    if (ok) {
+        *out = s_cache.count;
+    }
+    taskEXIT_CRITICAL();
+    return ok;
+}
+
 uint8_t Vision_LinkAlive(void) {
     taskENTER_CRITICAL();
     uint8_t alive = (HAL_GetTick() - s_cache.frame_tick) <= CFG_K230_LINK_DEAD_MS;
@@ -111,6 +140,11 @@ void Vision_Flush(void) {
     s_cache.none_cnt     = 0u;
     s_cache.frame_tick   = HAL_GetTick(); /* 从这里才开始要求 K230 有流量 */
     s_cache.target_tick  = HAL_GetTick();
+    /* ★ 数量位也要从零开始计：清缓存前那一帧的数量属于"别的时候的托盘"，
+       直接拿来复核 = 拿旧账对新账（复核的第一个动作就是等**清缓存之后**的第一帧） */
+    s_cache.count_valid = 0u;
+    s_cache.count       = 0u;
+    s_cache.count_tick  = HAL_GetTick();
     taskEXIT_CRITICAL();
 }
 

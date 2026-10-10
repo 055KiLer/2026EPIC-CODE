@@ -20,6 +20,11 @@ extern "C" {
 #define X_LIMIT_GPIO_Port GPIOB
 #define Y_LIMIT_Pin GPIO_PIN_5
 #define Y_LIMIT_GPIO_Port GPIOC
+/* 投放点激光检测（2026-10-09 新增硬件）：上拉输入、**不接 EXTI**——判据是"投放窗口内捕获
+   落料脉冲"（电平连续 ~2ms，见 sort_config.h 该节），没有沿语义。
+   ★ 用户实测接线：**PD14**，检测到物块 = 低电平 */
+#define LASER_PART_Pin GPIO_PIN_14
+#define LASER_PART_GPIO_Port GPIOD
 
 void Error_Handler(void);
 

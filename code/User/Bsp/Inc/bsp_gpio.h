@@ -20,6 +20,16 @@ uint8_t Bsp_Gpio_LimitX(void);
 uint8_t Bsp_Gpio_LimitY(void);
 uint8_t Bsp_Gpio_TrayOrigin(void);
 
+/* ★ 投放点激光检测（2026-10-09）：两条读口（判据与处置见 sort_config.h 该节）。
+   Bsp_Gpio_LaserPart()  = 1 = 此刻读到"检测到"电平。模块输出若是**稳态电平**用它；
+                           ⚠️ 台架实测这套模块给的是**极窄事件**（≈1µs，落了就回），
+                           1ms 级的电平轮询抓不到它 —— 那种情形靠下面这条
+   Bsp_Gpio_LaserEdges() = "检测到"的**下降沿**累计数（EXTI14 里 ++，只计数，ISR 不做别的）。
+                           取证据 = "到点记下基准，窗口内看它涨没涨"（快照比大小，
+                           不需要清零、也不怕窗口外的沿进来） */
+uint8_t  Bsp_Gpio_LaserPart(void);
+uint32_t Bsp_Gpio_LaserEdges(void);
+
 /**
  * @brief  取走并清除累积的 EXTI 事件
  * @retval 位掩码；同种事件在读取前多次触发会合并（对急停语义无损）

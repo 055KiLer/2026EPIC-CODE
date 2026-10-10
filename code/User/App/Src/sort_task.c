@@ -1,14 +1,21 @@
 /**
  * @file    sort_task.c
  * @brief   分拣任务（对应电控文档 §3.2 主分拣循环）
- * @note    循环骨架：标定可信? -> [到读帧位（投放点上方）＋静默期] -> 领目标
- *          -> [转盘预定位(与 XY 并行) + XY 移动] -> 转盘索引复核 -> 抓取 -> 投放
- *          -> 显示(等本轮回执) -> （就停在读帧位）下一件
+ * @note    循环骨架：标定可信? -> [到读帧位（投放点上方）＋静默期] -> **读事件（领目标 +
+ *          给上一件的到账数量复核）** -> [转盘预定位(与 XY 并行) + XY 移动] -> 转盘索引复核
+ *          -> 抓取 -> 到投放点 + 松爪 -> （就停在读帧位，等下一次读事件）下一件
  *
- *          三类"不干净"的处置：
+ *          四类"不干净"的处置：
  *            运动不可信（撞限位/丢步/发不出去）-> 本件作废，下轮开头自动重新回零
  *            视觉链路断 -> 停在待机点等恢复，这不等于"托盘已空"，绝不能报完成
  *            刷屏无回执 -> 停在原地按同一序号重投（题目红线：显示完成前不得分拣下一件）
+ *            数量复核判"没减一"（R5）-> **不计数、不刷屏**，本件按作废走：货还在托盘上，
+ *                              上位机会继续报它 ⇒ 下一轮自然重试（见 Sort_VerifyPending）
+ *
+ *          ★ 成功判据 = **两帧数量差 1**（2026-10-10 现场口径，替代激光闸门）：
+ *            发车帧（领目标那一帧）数量 N、到账帧（下一轮清缓存后的第一帧）数量 M，
+ *            M == N-1 才计数刷屏。两帧的取帧时机、空盘静默窗、口径外的代价
+ *            都写在 sort_config.h 的"数量复核"一节（那是本文件的规格书）。
  *
  *          作废统一走 Sort_Settle：先就地轻放货物，再结清转盘那笔异步运动。
  *          带着货进下一轮会把货拖出装置 = 直接判本轮结束，比少分拣一件严重得多
@@ -18,6 +25,7 @@
 #include "vision_task.h"
 #include "display_task.h"
 #include "motion_app.h"
+#include "bsp_gpio.h"
 #include "servo.h"
 #include <FreeRTOS.h>
 #include <task.h>
@@ -38,12 +46,51 @@ static const uint8_t s_category_to_bin[CFG_NUM_CATEGORIES] = {
 static const uint16_t s_grip_half_us[CFG_NUM_SHAPES]  = CFG_GRIP_HALF_US;
 static const uint16_t s_grip_close_us[CFG_NUM_SHAPES] = CFG_GRIP_CLOSE_US;
 
-/* 只有投放成功才 ++，所以屏上 6 行计数之和永远等于真实件数（丢一件会被判成计数错误）；
+/* 只有投放**复核通过**才 ++，所以屏上 6 行计数之和永远等于真实件数（丢一件会被判成计数错误）；
    同时它单调递增，既当 display 回执握手的序号，也当 display 侧"这一件是否已计数"的去重凭据 */
 static uint16_t s_total = 0u;
 
+/* 判"没减一"（夹空/滑脱/补货干扰）的累计次数（诊断，屏上不体现——屏只有 6 行成功数）。
+   装机/调机时靠它区分"机器在空转"与"根本没读到数量位"（后者见 Sort_CountNoFrame）*/
+static uint16_t s_count_miss = 0u;
+/* 到账帧迟迟不来（超过 CFG_COUNT_WAIT_MS）的累计次数（诊断）：链路/上位机停发的可见凭据 */
+static uint16_t s_count_noframe = 0u;
+
+uint16_t Sort_CountMissCount(void) {
+    return s_count_miss;
+}
+
+uint16_t Sort_CountNoFrameCount(void) {
+    return s_count_noframe;
+}
+
+/* 激光判"夹空"的累计次数（诊断）：CFG_LASER_ENABLE=0（现场配置）时恒 0 —— 激光已退出闸门 */
+static uint16_t s_laser_miss = 0u;
+
+uint16_t Sort_LaserMissCount(void) {
+    return s_laser_miss;
+}
+
+/* ★ 待复核件（2026-10-10 数量复核）：本件的"发车帧数量 + 类别"在这里等着下一次读事件
+   （投放动作一走完就记下，真正的成功判定发生在下一轮清缓存后的第一帧，见 Sort_VerifyPending）。
+   0 = 没有待复核件（作废在本件投放之前、或已经复核完了） */
+static uint8_t s_pending = 0u;
+static uint8_t s_pending_cat = 0u; /* 复核通过要刷的那一行 = 本件类别 */
+static uint8_t s_pending_n0 = 0u;  /* 发车帧数量 N（本件还没被抓走时的托盘件数，≥1）*/
+
 /* 1 = 龙门已在读帧位（投放点上方）且静默期已过，允许取帧；见 Sort_PrepareRead */
 static uint8_t s_read_ready = 0u;
+
+/* 1 = 本轮"空盘静默窗"已经给过（补货用）——同一段空盘只给一次，读到目标就清 */
+static uint8_t s_refill_hold_done = 0u;
+
+/* ★ 1 = "刚读到那个为零的帧"（到账数量 0）⇒ 主循环必须给一段静默窗（2026-10-10 二稿）。
+   用户口径是**无条件**的："已经读到那个为零的帧的时候，之后延时 5 秒钟，什么都不读，
+   等等我们把物块重新放上去"。第一版把它挂在"托盘已空（连读 10 帧无目标）"上 ⇒
+   操作员在窗内**先放**一件的话，空盘判据当场被目标帧清掉、窗被跳过 ⇒ 机器立刻开工,
+   与还在往里放的操作员抢时间 ⇒ 那一件的到账数量对不上（少计，仿真 s29 抓到）。
+   现在改成"读到零帧就记一笔"，由主循环统一兑现（见 SortTask 的静默窗分支）。*/
+static uint8_t s_refill_zero_seen = 0u;
 
 static uint8_t Sort_Goto(float x_mm, float y_mm) {
     return Motion_MoveXYBlocking(x_mm, y_mm, CFG_XY_SPEED_MM_S);
@@ -97,13 +144,63 @@ static void Sort_ReleaseIfHolding(uint8_t *loaded) {
     *loaded = 0u;
 }
 
-/* 投放：抬升位直接张开松爪，松爪后**保持全开**（2026-10-01 用户口径：投放后回闭合，
-   龙门平移去抓下一件时闭合的爪会撞托盘边/旁边物块——巡航全开是机构硬约束；
-   下一件 Sort_Grab 第一步本来就要先张爪，这里不闭合正好衔接上）。
-   不读码（货物顶面二维码属模拟污渍） */
-static void Sort_Drop(void) {
-    Servo_ClawSet(SERVO_CLAW_OPEN);
+/* ★ 投放点激光证据（2026-10-09；完整口径见 sort_config.h 该节）：
+   窗口内出现"**一次检测**"就算（用户口径："只要检测脉冲就可以了"）——两种形式都收：
+     ① **下降沿计数比基准涨了**：台架实测一次落料 ≈ **1µs 宽的窄事件**，
+        1ms 电平轮询会漏 ⇒ 只有 PD14/EXTI14 的沿抓得住（这是主路径）
+     ② 此刻电平正是"检测到"：模块输出若是稳态电平（另一种模块/接法），用这条兜
+   edges0 = 进窗口前记下的沿计数基准 ⇒ 窗口外的沿（路上、别的时段）不算数 */
+#if CFG_LASER_ENABLE
+static uint8_t Sort_LaserEvidence(uint32_t edges0) {
+    if (Bsp_Gpio_LaserEdges() != edges0) {
+        return 1u;
+    }
+    return (Bsp_Gpio_LaserPart() != 0u) ? 1u : 0u;
+}
+#endif
+
+/* ★ 投放（松爪）：到投放点 → 静置（CFG_DROP_SETTLE_MS，等龙门停稳）→ 松爪 → 等舵机行程。
+   ★ 激光复核（2026-10-09）挂在同一动作上，但**现场已关闸**（CFG_LASER_ENABLE=0，2026-10-10）：
+   激光模块被夹爪遮住 ⇒ 分不清"货落下"与"爪在光路里" ⇒ 判据换成数量复核
+   （见 sort_config.h 的"数量复核"一节、本文件的 Sort_VerifyPending）。
+   激光那一支保留在下面（哪天模块挪开就是把 CFG_LASER_ENABLE 改回 1 的事）：
+   窗口内出现"一次检测"就算——① 下降沿计数比基准涨了（台架实测一次落料 ≈1µs 窄事件，
+   1ms 电平轮询会漏，只有 PD14/EXTI14 的沿抓得住）② 此刻电平正是"检测到"（稳态电平型模块）。
+   @retval 1 = 松爪动作已走完（激光关闸，恒 1）或激光窗口内捕到检测
+           0 = 激光开着但窗口内一次都没有（夹空：爪里本来就没货） */
+static uint8_t Sort_DropOpen(void) {
+#if CFG_LASER_ENABLE
+    uint32_t t0;
+
+    /* 窗口基准：到点这一刻记下沿计数（窗口外的沿——路上、别的时段——不算数） */
+    uint32_t edges0 = Bsp_Gpio_LaserEdges();
+
+    vTaskDelay(pdMS_TO_TICKS(CFG_DROP_SETTLE_MS)); /* 等龙门停稳再松爪、再等证据 */
+    uint8_t  seen = Sort_LaserEvidence(edges0);    /* 松爪前先看一眼（稳态电平型模块也算证据） */
+
+    Servo_ClawSet(SERVO_CLAW_OPEN);                /* 松爪：货落下 = 那一下窄事件 */
+    t0 = HAL_GetTick();
+    while (seen == 0u) {
+        if ((HAL_GetTick() - t0) >= CFG_LASER_WAIT_MS) {
+            break; /* 窗口内没证据 = 夹空（空爪松爪也是这个结果：本来就没东西落下来） */
+        }
+        vTaskDelay(pdMS_TO_TICKS(CFG_LASER_POLL_MS));
+        seen = Sort_LaserEvidence(edges0);
+    }
+
+    /* 捕到会提前退出：把舵机行程时间补足（与旧 Sort_Drop 的 400ms 同理） */
+    if ((HAL_GetTick() - t0) < (uint32_t)CFG_SERVO_MOVE_MS) {
+        vTaskDelay(pdMS_TO_TICKS((uint32_t)CFG_SERVO_MOVE_MS - (uint32_t)(HAL_GetTick() - t0)));
+    }
+    return seen;
+#else
+    /* 激光关闸（现场配置）：松爪 + 等舵机行程，恒判 1 —— "到底抓没抓到"由下一轮
+       读事件的数量差裁定（Sort_VerifyPending），不再在这里判 */
+    vTaskDelay(pdMS_TO_TICKS(CFG_DROP_SETTLE_MS)); /* 等龙门停稳再松爪（与复核方式无关） */
+    Servo_ClawSet(SERVO_CLAW_OPEN);                /* 松爪 + 保持全开（巡航安全形） */
     vTaskDelay(pdMS_TO_TICKS(CFG_SERVO_MOVE_MS));
+    return 1u;
+#endif
 }
 
 /* 标定兜底：XY 与转盘记账各自独立，哪条不可信就重标哪条。上电首次进主循环时两条都
@@ -162,6 +259,62 @@ static void Sort_UpdateDisplay(uint8_t category) {
     }
 }
 
+/* ★ 到账复核（2026-10-10；规格 = sort_config.h 的"数量复核"一节）：拿**到账帧的数量** M
+   给上一件定案 ——
+       M == N-1（N = 发车帧数量，本件还没被抓走时的托盘件数）⇒ 托盘确实少了一件
+                ⇒ 本件真投放 ⇒ 计数 + 刷屏（屏上的数只有这一处会加）
+       否则    ⇒ **不计数**：M == N = 夹空/滑脱（货还在托盘上，下一轮自然重抓）；
+                其它 = 口径之外（运行中补货）⇒ 宁可少计，绝不虚增
+   ★ 判决用的是"读懂的数量"而不是"动作走完了"：这是与旧口径（动作走完就计数）唯一的差别，
+     也是现场"夹持失败但数量加一"那条缺陷的解药（反证见仿真 s24：关掉复核 ⇒ 屏上比盒里多出抓空次数）。
+   @param count_now 到账帧的数量位（= 清缓存之后的第一帧，任何状态都算） */
+static void Sort_VerifyPending(uint8_t count_now) {
+#if CFG_COUNT_VERIFY_ENABLE
+    /* ★ "读到那个为零的帧" = 到账帧数量 0（托盘刚被我方清空）⇒ 记一笔静默窗（无条件，
+       与本次判定成不成无关：托盘空了就该给操作员补给的时间） */
+    if (count_now == 0u) {
+        s_refill_zero_seen = 1u;
+    }
+    if (s_pending == 0u) {
+        return; /* 没有待复核件（本件作废在投放之前，或上一件已经复核过了） */
+    }
+    s_pending = 0u;
+    if ((uint8_t)(count_now + 1u) == s_pending_n0) { /* M == N-1（写成加法：N=0 时不回绕） */
+        s_total++;
+        Sort_UpdateDisplay(s_pending_cat);
+        return;
+    }
+    s_count_miss++; /* 数量没减一：夹空/滑脱（可见的少计）或运行中补货（口径外的代价） */
+#else
+    (void)count_now; /* 复核关掉（旧口径）：投放动作走完时就已经计数刷屏了，这里什么都不做 */
+#endif
+}
+
+/* ★ 读事件（数量复核的"到账"时刻）：等**清缓存之后的第一帧**来给上一件定案。
+   为什么是"清缓存后第一帧"：清缓存之前的帧属于"别的时候的托盘"（可能正是投放前拍的），
+   拿它复核 = 拿旧账对新账 ⇒ 会把真投放判成没减一。
+   为什么等的是**任何状态**的帧、而不只是目标帧：托盘空了就没有目标帧了——
+   末件的 +1 与空盘静默窗全指望状态 00 的帧（它同样带数量位，见 k230_uart.h）。
+   @retval 1 = 已复核（或本就没有待复核件）  0 = 等到超时（CFG_COUNT_WAIT_MS）：
+             链路/上位机停发 —— 本件挂起、由调用方等链路恢复后重试，绝不带着旧账往下走 */
+static uint8_t Sort_ReadEvent(void) {
+#if CFG_COUNT_VERIFY_ENABLE
+    uint32_t t0    = HAL_GetTick();
+    uint8_t  count = 0u;
+
+    while (Vision_GetCount(&count) == 0u) {
+        if ((HAL_GetTick() - t0) >= CFG_COUNT_WAIT_MS) {
+            return 0u;
+        }
+        vTaskDelay(pdMS_TO_TICKS(5u)); /* 帧周期 100ms：等一帧最多 20 步 */
+    }
+    Sort_VerifyPending(count);
+    return 1u;
+#else
+    return 1u; /* 复核关掉：读事件退化成空操作（没有待复核件这回事） */
+#endif
+}
+
 /* 作废出口的统一收尾：先放货（物理风险最高），再结清转盘那笔异步运动。
    Motion_TrayFinish 在上一笔已结清时是空操作，所以每个作废点都能无条件调；
    但绝不能不调：不结清就返回，下一轮会在上一笔仍在执行时再叠一笔相对运动 */
@@ -170,7 +323,66 @@ static void Sort_Settle(uint8_t *loaded, uint32_t tray_est_ms) {
     (void)Motion_TrayFinish(tray_est_ms);
 }
 
-/* @retval 1=已投放、已计数、已刷屏  0=本件作废（不投放、不计数） */
+/* ★ 目标钳位（2026-10-10 从 Sort_DoCycle 里收出来：四条规则本来就是**一条链**，原先散在
+   四段注释里，读起来像四个独立开关）。入参 = Vision_ToMachine 出的机械坐标，出参 = 钳位后的
+   目标；顺序不能改（每条的输入是上一条的输出）：
+     ① **-X 夹爪延伸带**（2026-10-01 台架口径）：物块可出现在 X ∈ [CFG_XY_X_CLAMP_MM, X_MIN)
+        ——龙门停在 X_MIN 时夹爪构造仍够得着 ⇒ 钳到 X_MIN 就近夹；比 CLAMP 还远作废本件
+     ② **+X/+Y 极限位夹取带**（2026-10-08 用户口径"到限位之后就按最极限的位置，不管怎么样都
+        直接夹"）：落在 (上限, 上限+带] 的目标钳到上限照样伸爪；带值先与 CFG_WORK_OVERSHOOT_MM
+        取大（带值 = 0 时退化成旧的"只允许 3mm 微越界"口径），带外作废本件
+     ③ **限位开关保护边距**（2026-10-08；2026-10-10 边距 5 → 3mm）：最大端就是回零开关
+        所在处（触发点 = 坐标 0 + 3mm），钳到上限等于每抓一次贴边件就朝开关顶满最后 3mm
+        ——纯开环漂移吃掉那 3mm 就会真压开关 ⇒ 作废 XY 记账 ⇒ 下一圈白回零（"抓完自己
+        回零校准"）。回拉到 `上限 − 边距`（3mm，见 sort_config.h 该宏注释）：夹爪有
+        ~25mm 延伸带，少走这 3mm 照样夹得住，换来"永不朝开关方向顶满"
+   在规则之外作废的件：**转盘还没动、爪未动，无在途动作需要 settle**，直接 return 即可。
+   ⚠️ -Y 下限（= 投放点）不在本函数管：越界由 Motion_MoveXYBlocking 的工作包络拒绝
+      ⇒ Sort_Goto 失败 ⇒ 走作废路径（与 Sort_DoCycle 里其余失败同口径）
+   ⚠️ 上位机会持续重报同一目标 ⇒ 被作废的件会反复尝试：这是"看得见够不着"的可见故障，
+      好过静默抓空计虚数（判据见台架 `read` 的越界判词）
+   @retval 1 = 可用（*x_mm / *y_mm 已就地钳位）  0 = 整件作废 */
+static uint8_t Sort_ClampTarget(float *x_mm, float *y_mm) {
+    float x = *x_mm;
+    float y = *y_mm;
+    /* 带值取"带"与"微越界允许量"里的较大者：带值 = 0 时退化成旧口径 */
+    float band_x = (CFG_XY_X_CLAMP_BAND_MM > CFG_WORK_OVERSHOOT_MM) ? CFG_XY_X_CLAMP_BAND_MM
+                                                                    : CFG_WORK_OVERSHOOT_MM;
+    float band_y = (CFG_XY_Y_CLAMP_BAND_MM > CFG_WORK_OVERSHOOT_MM) ? CFG_XY_Y_CLAMP_BAND_MM
+                                                                    : CFG_WORK_OVERSHOOT_MM;
+
+    if (x < CFG_WORK_X_MIN_MM) { /* ① */
+        if (x < CFG_XY_X_CLAMP_MM) {
+            return 0u;
+        }
+        x = CFG_WORK_X_MIN_MM;
+    }
+    if (x > CFG_WORK_X_MAX_MM) { /* ② */
+        if (x > (CFG_WORK_X_MAX_MM + band_x)) {
+            return 0u;
+        }
+        x = CFG_WORK_X_MAX_MM;
+    }
+    if (y > CFG_WORK_Y_MAX_MM) { /* ②（Y 只有上限侧：下限 = 投放点，越界交给运动层拒绝） */
+        if (y > (CFG_WORK_Y_MAX_MM + band_y)) {
+            return 0u;
+        }
+        y = CFG_WORK_Y_MAX_MM;
+    }
+    if (x > (CFG_WORK_X_MAX_MM - CFG_WORK_EDGE_MARGIN_MM)) { /* ③ */
+        x = CFG_WORK_X_MAX_MM - CFG_WORK_EDGE_MARGIN_MM;
+    }
+    if (y > (CFG_WORK_Y_MAX_MM - CFG_WORK_EDGE_MARGIN_MM)) {
+        y = CFG_WORK_Y_MAX_MM - CFG_WORK_EDGE_MARGIN_MM;
+    }
+
+    *x_mm = x;
+    *y_mm = y;
+    return 1u;
+}
+
+/* @retval 1=本件已投放（是否计数由下一轮读事件的数量复核裁定，见 Sort_VerifyPending）
+           0=本件作废（不投放、不计数） */
 static uint8_t Sort_DoCycle(const K230_Target_t *target) {
     float   target_x = 0.0f;
     float   target_y = 0.0f;
@@ -179,54 +391,9 @@ static uint8_t Sort_DoCycle(const K230_Target_t *target) {
 
     Vision_ToMachine(target, &target_x, &target_y);
 
-    /* ★ 夹爪延伸夹取带（2026-10-01 台架口径）：物块可出现在 X ∈ [CLAMP, X_MIN)——龙门停在
-       X_MIN 时夹爪构造仍够得着。目标 X 超出软限位就**钳位到 X_MIN 就近夹取**；比 CLAMP
-       还远的作废本件（转盘还没动、爪未动，无在途动作需要 settle）。⚠️ 上位机会持续重报
-       同一目标 → 会反复尝试同一件：这是"看得见够不着"的可见故障，好过静默抓空计虚数 */
-    if (target_x < CFG_WORK_X_MIN_MM) {
-        if (target_x < CFG_XY_X_CLAMP_MM) {
-            return 0u;
-        }
-        target_x = CFG_WORK_X_MIN_MM;
-    }
-    /* ★ +X/+Y 微越界钳位（CFG_WORK_OVERSHOOT_MM，2026-10-02）：软限位 0 给回零开关留了
-       3mm 内收，物块贴外沿映射到 (0,+3] 时机构仍可达，钳回 0 就近夹取；超过 = 标定/
-       镜像问题，作废本件（上位机会持续重报同一目标 → 表现为"机器不动"——先核物块
-       是不是贴边 + 坐标微微越界，别当成新鲜度问题排查）。同样无在途动作，无需 settle */
-    /* ★ 极限位夹取带（2026-10-08 用户口径："y 轴过于偏夹不到——到限位之后就按最极限的位置，
-       不管怎么样都直接夹"）：带内（上限 + 带值 之内）不再作废，钳到极限位照样伸爪
-       （下面还有"保护边距"再让开 CFG_WORK_EDGE_MARGIN_MM）；带外才作废本件。
-       带值 = 0 时退化成旧的"只允许 CFG_WORK_OVERSHOOT_MM 微越界"口径 */
-    float band_x = (CFG_XY_X_CLAMP_BAND_MM > CFG_WORK_OVERSHOOT_MM) ? CFG_XY_X_CLAMP_BAND_MM
-                                                                   : CFG_WORK_OVERSHOOT_MM;
-    float band_y = (CFG_XY_Y_CLAMP_BAND_MM > CFG_WORK_OVERSHOOT_MM) ? CFG_XY_Y_CLAMP_BAND_MM
-                                                                   : CFG_WORK_OVERSHOOT_MM;
-
-    if (target_x > CFG_WORK_X_MAX_MM) {
-        if (target_x > CFG_WORK_X_MAX_MM + band_x) {
-            return 0u; /* 超出延伸带：夹爪也够不着 */
-        }
-        target_x = CFG_WORK_X_MAX_MM;
-    }
-    if (target_y > CFG_WORK_Y_MAX_MM) {
-        if (target_y > CFG_WORK_Y_MAX_MM + band_y) {
-            return 0u;
-        }
-        target_y = CFG_WORK_Y_MAX_MM;
-    }
-
-    /* ★ 限位开关保护边距（2026-10-08）：X/Y 最大端就是回零开关所在处（触发点 = 坐标 0 + 3mm），
-       上面那条"微越界钳位"却会把龙门**指到 0**——等于每抓一次贴边件就朝开关顶满最后 3mm。
-       纯开环的漂移/丢步（或跳齿）一旦吃掉这 3mm，开关真被压下 ⇒ 守护任务按"真撞限位"
-       作废 XY 记账 ⇒ 下一圈重新回零（现场看到的"抓完自己回零校准"）。这里把落在保护边距内
-       的目标回拉到 `上限 − 边距`——夹爪有 ~25mm 延伸带（CFG_XY_X_CLAMP_MM 一节），
-       少走 5mm 照样夹得住，换来"永远不朝开关方向顶满"。只作用于最大端：-Y 下限 = 投放点
-       必须走满、-X 走延伸带，都不受影响 */
-    if (target_x > (CFG_WORK_X_MAX_MM - CFG_WORK_EDGE_MARGIN_MM)) {
-        target_x = CFG_WORK_X_MAX_MM - CFG_WORK_EDGE_MARGIN_MM;
-    }
-    if (target_y > (CFG_WORK_Y_MAX_MM - CFG_WORK_EDGE_MARGIN_MM)) {
-        target_y = CFG_WORK_Y_MAX_MM - CFG_WORK_EDGE_MARGIN_MM;
+    /* 目标钳位（延伸带 / 极限位夹取带 / 保护边距，见函数头）：带外 ⇒ 本件作废 */
+    if (!Sort_ClampTarget(&target_x, &target_y)) {
+        return 0u;
     }
 
     /* 步骤2+3：转盘预定位（异步）与 XY 移动并行，谁慢等谁 */
@@ -242,22 +409,39 @@ static uint8_t Sort_DoCycle(const K230_Target_t *target) {
         return 0u;
     }
 
-    /* 步骤4：抓取（按形状选夹持方案；不装到位开关，抓空风险 R5 已接受） */
+    /* 步骤4：抓取（按形状选夹持方案）。"到底抓没抓到"不再靠假设：由投放后那一帧的数量差裁定 */
     Sort_Grab(target->shape);
     loaded = 1u;
 
-    /* 步骤6：投放（落差由机械侧转盘格兜底，R1）。
-       从这里开始本件已经成功，后续任何一步失败都不回退计数 */
+    /* 步骤6：投放（落差由机械侧转盘格兜底，R1）。松爪 = 投放动作，成功与否由读事件定案 */
     if (!Sort_Goto(CFG_DROP_X_MM, CFG_DROP_Y_MM)) {
         Sort_Settle(&loaded, tray_est_ms);
         return 0u;
     }
-    Sort_Drop();
-    loaded = 0u;
-    s_total++;
+    uint8_t dropped = Sort_DropOpen(); /* 静置 + 松爪（+ 激光复核，若闸门开着） */
+    loaded = 0u;                       /* 爪已全开（Sort_DropOpen 收尾保证），手里不再有东西 */
 
-    /* 步骤7：显示更新（内部保证"本轮已刷完"才返回，红线在此守住） */
+    if (dropped == 0u) {
+        /* 激光闸门开着时才会走到这里（现场已关闸）：空爪松开在物理上无风险（转盘早已为这一类
+           转好盒；万一"传感器看走了眼、货其实还在爪里"，它也是落进自己的盒），但**不计数** */
+        s_laser_miss++;
+        Sort_Settle(&loaded, tray_est_ms);
+        return 0u;
+    }
+
+#if CFG_COUNT_VERIFY_ENABLE
+    /* ★ 不在这里计数、也不在这里刷屏（2026-10-10 数量复核）：投放动作走完了 ≠ 抓到了货。
+       把"发车帧数量 + 类别"记成待复核件，真正的定案交给**下一轮读事件**（Sort_ReadEvent →
+       Sort_VerifyPending）——那时候已经清过缓存、拿到投放之后的托盘新账（数量差 1 才 +1）。
+       屏上"显示完成前不得分拣下一件"的红线不受影响：定案与刷屏都发生在下一件动身之前 */
+    s_pending     = 1u;
+    s_pending_cat = target->category;
+    s_pending_n0  = target->count;
+#else
+    /* 旧口径（复核关掉）：投放动作走完就认成功，立即计数 + 刷屏 */
+    s_total++;
     Sort_UpdateDisplay(target->category);
+#endif
 
     /* 步骤8：**不回待机点**——就停在投放点上方（= 读帧位，见 Sort_PrepareRead）。
        回待机点那趟路会让龙门重新扫过托盘、挡住相机，而且下一件还要再走回来。
@@ -303,8 +487,22 @@ void SortTask(void *argument) {
             }
             s_read_ready = 1u;
         }
-        /* 读 vision_task 缓存里"未消费且仍新鲜"的一帧 */
+        /* ★ 读事件（2026-10-10）：先把**上一件**的到账复核落地，再领新目标。
+           等不到帧（超时）= 链路问题 ⇒ 本件挂起、**绝不往下走**：带着没结的账去抓下一件，
+           两件的数量差会搅在一起，那一件就永远判不出来了。等链路恢复后重试即可
+           （期间机器没动过托盘，账还对得上） */
+        if (s_pending != 0u) {
+            if (!Sort_ReadEvent()) {
+                s_count_noframe++;
+                if (!Vision_LinkAlive()) {
+                    Sort_WaitVisionLink(); /* 等恢复（内部清缓存）⇒ 回来重取第一帧 */
+                }
+                continue;
+            }
+        }
+        /* 读 vision_task 缓存里"未消费且仍新鲜"的一帧（它自带发车帧数量 N） */
         if (Vision_GetTarget(&target)) {
+            s_refill_hold_done = 0u; /* 又有货可抓：空盘静默窗重新计（见下面的空盘分支） */
             (void)Sort_DoCycle(&target);
             /* 本件结束：龙门已离开读帧位（成功时在投放点、作废时在轻放点），
                且物块刚被取走/放回，下一帧必须重新等视觉更新 */
@@ -315,6 +513,27 @@ void SortTask(void *argument) {
             Sort_WaitVisionLink();
             continue;
         }
+        /* ★ 空盘静默窗（CFG_REFILL_HOLD_MS，用户口径 5s；见 sort_config.h"数量复核"一节）。
+           **两个触发口，同一段空盘只给一次**（`s_refill_hold_done`，读到目标即重新计）：
+             ① 零帧口（主用）：上一件的到账帧数量 = 0 —— "已经读到那个为零的帧" ⇒ 立刻给窗。
+                必须**无条件**（不看此刻有没有新目标）：操作员可能在窗内先放一件再放其余的，
+                若"见了目标就跳过窗"，机器会与还在放货的人抢时间 ⇒ 那一件的到账数量对不上
+                （少计；仿真 s29 就是这条的回归）。窗内**什么都不读**（不取帧、不计判、不刷屏）
+                ⇒ 操作员把货放完、退开，下一件的发车帧才是干净的新账
+             ② 空盘口（兜底）：上电时托盘本来就是空的 —— 没有"上一件"，也就没有零帧，
+                用"连续 M 帧无目标"判空后给同样的窗（同样只给一次）
+           窗后一律：清缓存 + 重走"到读帧位 + 静默期 + 取帧"（`s_read_ready = 0`） */
+#if CFG_COUNT_VERIFY_ENABLE
+        if ((s_refill_zero_seen != 0u) ||
+            ((Vision_TrayEmpty() != 0u) && (s_refill_hold_done == 0u))) {
+            s_refill_zero_seen = 0u;
+            s_refill_hold_done = 1u;
+            vTaskDelay(pdMS_TO_TICKS(CFG_REFILL_HOLD_MS));
+            Vision_Flush();
+            s_read_ready = 0u;
+            continue;
+        }
+#endif
         /* 托盘已空 -> 停在原点待机，屏上保留最终计数。这不是不可逆状态：
            再放货物、K230 重新报目标就自动继续分拣 */
         if (Vision_TrayEmpty()) {

@@ -26,6 +26,15 @@ uint8_t Vision_GetTarget(K230_Target_t *out);
 /* 视觉链路是否活着（最近有校验通过的帧） */
 uint8_t Vision_LinkAlive(void);
 
+/**
+ * @brief  ★ 最近一帧的**数量位**（2026-10-10 数量复核用；含状态 00 的无目标帧）
+ * @param  out 数量 0~255
+ * @retval 1=取到（自上次 Vision_Flush 之后已经来过校验通过的帧）  0=还没来帧/链路超时
+ * @note   返回 0 = "还没来帧"，与"来了一帧、数量是 0"是两件事：
+ *         清缓存后的等待循环靠这个区分，绝不要把"还没来帧"当"托盘空了"
+ */
+uint8_t Vision_GetCount(uint8_t *out);
+
 /* 是否判定"托盘已空、本轮分拣完成"；链路死了绝不返回 1（那是故障不是完成） */
 uint8_t Vision_TrayEmpty(void);
 

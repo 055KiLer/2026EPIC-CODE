@@ -21,6 +21,8 @@ typedef struct {
 
 static volatile uint32_t s_events;
 static volatile uint32_t s_tray_index_cnt;
+/* ★ 投放点激光检测（2026-10-09）："检测到"的下降沿累计数（EXTI14 里 ++）——窄事件只认沿 */
+static volatile uint32_t s_laser_edges;
 /* ★ 转盘索引沿"待确认"时刻（≠0 = 收到一个沿、正在等电平确认压住才计数） */
 static volatile uint32_t s_idx_pending_tick;
 static Bsp_LimDbc_t s_lim_x;
@@ -44,6 +46,22 @@ uint8_t Bsp_Gpio_TrayOrigin(void) {
         (HAL_GPIO_ReadPin(CFG_ORIGIN_GPIO_TRAY, CFG_ORIGIN_PIN_TRAY) == CFG_LIMIT_ACTIVE_LEVEL);
 
     return active ? 1u : 0u;
+}
+
+/* ★ 投放点激光检测（2026-10-09 新增硬件；2026-10-10 起**退出计数闸门**——爪挡光路，
+   成功判据换成视觉"两帧数量差 1"，见 sort_config.h 的"数量复核"一节）。
+   本口只回答"此刻引脚电平等不等于'检测到'"；静置、窗口、判夹空、放行/拒绝都在
+   sort_task.c（Sort_LaserEvidence / Sort_DropOpen，那一支现在编译不进来）。
+   ⚠️ 这条线上来的是**极窄事件**（台架实测 ≈1µs）——本读口只服务"模块输出是稳态电平"
+   的那种接法；窄事件靠下面的沿计数（EXTI14），见 sort_config.h 该节 */
+uint8_t Bsp_Gpio_LaserPart(void) {
+    uint8_t active = (HAL_GPIO_ReadPin(CFG_LASER_GPIO, CFG_LASER_PIN) == CFG_LASER_ACTIVE_LEVEL);
+
+    return active ? 1u : 0u;
+}
+
+uint32_t Bsp_Gpio_LaserEdges(void) {
+    return s_laser_edges;
 }
 
 uint32_t Bsp_Gpio_TakeEvents(void) {
@@ -141,5 +159,12 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin) {
         st->last_accept        = now;
         st->armed              = 0u;
         s_idx_pending_tick     = now; /* 待确认（确认在 Poll 里做，见 CFG_TRAY_INDEX_CONFIRM_MS） */
+    } else if (GPIO_Pin == CFG_LASER_PIN) {
+        /* ★ 投放点激光检测（2026-10-09）：**只计数**——判据与处置全在 App（sort_task.c）。
+           为什么必须走 EXTI：台架 `laser drop` 实测一次落料 ≈ **1 个采样点宽（µs 级）**，
+           1ms 级的电平轮询会漏掉 99.9% ⇒ 沿是唯一稳的抓法。
+           不消抖/不闩锁：事件本身一次性（一次落料一个沿），真伪由"投放窗口"把关
+           （窗口外的沿只涨计数、不被取用）——与限位开关那套弹跳消抖不是一回事 */
+        s_laser_edges++;
     }
 }
