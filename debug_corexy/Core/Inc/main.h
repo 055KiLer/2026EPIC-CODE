@@ -15,15 +15,17 @@ extern "C" {
 
 void Error_Handler(void);
 
-/* 下面这三个引脚标签本工程不用（这块板没接限位开关），
-   保留只是为了 Config/sort_config.h（产品那份**原样**拷来验算法的副本）末尾的
-   编译期核对能通过 —— 改它们没有意义 */
+/* 下面这些引脚标签本工程**不直接用**（接线走 dbg_config.h 的 DBG_CFG_* 表），
+   保留只是为了 Config/sort_config.h（**薄壳直含产品那份**）末尾的编译期核对能通过。
+   改接线改 dbg_config.h；改这里没有意义 */
 #define TRAY_ORIGIN_Pin GPIO_PIN_0
 #define TRAY_ORIGIN_GPIO_Port GPIOB
 #define X_LIMIT_Pin GPIO_PIN_1
 #define X_LIMIT_GPIO_Port GPIOB
 #define Y_LIMIT_Pin GPIO_PIN_5
 #define Y_LIMIT_GPIO_Port GPIOC
+#define LASER_PART_Pin GPIO_PIN_14
+#define LASER_PART_GPIO_Port GPIOD
 
 #ifdef __cplusplus
 }

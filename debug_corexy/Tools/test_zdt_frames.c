@@ -9,9 +9,10 @@
  *            ② 字面量 = 物创 `code/ZDT_drive.c` 里那些 static 帧数组（手册示例抄下来的）
  *          跑法（在 debug_corexy 目录下）：
  *            wsl -e bash -lc 'cd /mnt/d/CUBEMX\ DOCUMENT/工创/debug_corexy && \
- *              gcc -std=gnu99 -Wall -Wextra -I Tools/shim -I User/Bsp/Inc -I User/Devices/Inc \
- *              -I User/Devices/Src \
+ *              gcc -std=gnu99 -Wall -Wextra -I Tools/shim -I Config -I User/Bsp/Inc \
+ *              -I User/Devices/Inc -I User/Devices/Src \
  *              Tools/test_zdt_frames.c User/Devices/Src/zdt_bus.c -o /tmp/tf && /tmp/tf'
+ *          （-I Config 是必需的：zdt_bus.c 要用 sort_config.h 的 CFG_PULSE_PER_REV_42）
  */
 #include <stdio.h>
 #include <string.h>
